@@ -1,0 +1,13 @@
+[package]
+name = "rift-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rift"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rift = { path = "../core" }
