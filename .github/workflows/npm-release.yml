@@ -1,0 +1,113 @@
+name: Npm Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    name: Validate npm versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Match npm packages to release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node scripts/check-npm-versions.mjs "${TAG#v}"
+
+  build:
+    name: Build npm ${{ matrix.package }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: rift-snapshot-linux-x64
+            executable: rift
+          - os: macos-14
+            target: x86_64-apple-darwin
+            package: rift-snapshot-darwin-x64
+            executable: rift
+          - os: macos-14
+            target: aarch64-apple-darwin
+            package: rift-snapshot-darwin-arm64
+            executable: rift
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: rift-snapshot-windows-x64
+            executable: rift.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build CLI
+        run: cargo build --package rift-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Populate native package
+        shell: bash
+        run: node scripts/prepare-npm-package.mjs "npm/${{ matrix.package }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}"
+
+      - name: Upload native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.package }}
+          path: npm/${{ matrix.package }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install --global npm@^11.10.0
+
+      - name: Download native packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm-built
+
+      - name: Publish native packages
+        shell: bash
+        run: |
+          for package in npm-built/npm-*/; do
+            npm publish "$package" --provenance
+          done
+
+      - name: Publish launcher package
+        run: npm publish npm/rift-snapshot --provenance

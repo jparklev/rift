@@ -1,0 +1,38 @@
+{
+  "name": "rift-snapshot",
+  "version": "0.0.3",
+  "description": "Fast copy-on-write development workspaces",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/rift.git"
+  },
+  "bin": {
+    "rift": "bin/rift.exe"
+  },
+  "files": [
+    "bin",
+    "postinstall.mjs"
+  ],
+  "scripts": {
+    "postinstall": "node ./postinstall.mjs"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "optionalDependencies": {
+    "rift-snapshot-darwin-arm64": "0.0.3",
+    "rift-snapshot-darwin-x64": "0.0.3",
+    "rift-snapshot-linux-x64": "0.0.3",
+    "rift-snapshot-windows-x64": "0.0.3"
+  },
+  "publishConfig": {
+    "provenance": true
+  }
+}
