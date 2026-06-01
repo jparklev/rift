@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/ffi"]
 
 [workspace.package]
 edition = "2024"
@@ -13,6 +13,8 @@ dirs = "6.0"
 libc = "0.2"
 rand = "0.9"
 rusqlite = { version = "0.35", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tempfile = "3.20"
 thiserror = "2.0"
 ulid = "1.2"

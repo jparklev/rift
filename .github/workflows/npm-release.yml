@@ -28,7 +28,7 @@ jobs:
         run: node scripts/check-npm-versions.mjs "${TAG#v}"
 
   build:
-    name: Build npm ${{ matrix.package }}
+    name: Build npm ${{ matrix.platform }}
     needs: validate
     strategy:
       fail-fast: false
@@ -36,20 +36,24 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            package: rift-linux-x64
+            platform: linux-x64
             executable: rift
+            library: librift_ffi.so
           - os: macos-14
             target: x86_64-apple-darwin
-            package: rift-darwin-x64
+            platform: darwin-x64
             executable: rift
+            library: librift_ffi.dylib
           - os: macos-14
             target: aarch64-apple-darwin
-            package: rift-darwin-arm64
+            platform: darwin-arm64
             executable: rift
+            library: librift_ffi.dylib
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            package: rift-windows-x64
+            platform: windows-x64
             executable: rift.exe
+            library: rift_ffi.dll
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
@@ -65,18 +69,18 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Build CLI
-        run: cargo build --package rift-cli --release --locked --target ${{ matrix.target }}
+      - name: Build native artifacts
+        run: cargo build --package rift-cli --package rift-ffi --release --locked --target ${{ matrix.target }}
 
-      - name: Populate native package
+      - name: Populate prebuild
         shell: bash
-        run: node scripts/prepare-npm-package.mjs "npm/${{ matrix.package }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}"
+        run: node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/${{ matrix.platform }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "target/${{ matrix.target }}/release/${{ matrix.library }}"
 
-      - name: Upload native package
+      - name: Upload prebuild
         uses: actions/upload-artifact@v4
         with:
-          name: npm-${{ matrix.package }}
-          path: npm/${{ matrix.package }}
+          name: npm-prebuild-${{ matrix.platform }}
+          path: npm/rift-snapshot/prebuilds/${{ matrix.platform }}
           if-no-files-found: error
 
   publish:
@@ -96,21 +100,32 @@ jobs:
       - name: Upgrade npm for trusted publishing
         run: npm install --global npm@^11.10.0
 
-      - name: Download native packages
+      - name: Download Linux x64 prebuild
         uses: actions/download-artifact@v4
         with:
-          pattern: npm-*
-          path: npm-built
+          name: npm-prebuild-linux-x64
+          path: npm/rift-snapshot/prebuilds/linux-x64
 
-      - name: Restore native executable permissions
-        run: chmod +x npm-built/npm-rift-linux-x64/bin/rift npm-built/npm-rift-darwin-x64/bin/rift npm-built/npm-rift-darwin-arm64/bin/rift
+      - name: Download macOS x64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-darwin-x64
+          path: npm/rift-snapshot/prebuilds/darwin-x64
 
-      - name: Publish native packages
-        shell: bash
-        run: |
-          for package in npm-built/npm-*/; do
-            npm publish "$package" --provenance
-          done
+      - name: Download macOS arm64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-darwin-arm64
+          path: npm/rift-snapshot/prebuilds/darwin-arm64
+
+      - name: Download Windows x64 prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-prebuild-windows-x64
+          path: npm/rift-snapshot/prebuilds/windows-x64
+
+      - name: Restore executable permissions
+        run: chmod +x npm/rift-snapshot/prebuilds/linux-x64/* npm/rift-snapshot/prebuilds/darwin-x64/* npm/rift-snapshot/prebuilds/darwin-arm64/*
 
       - name: Publish launcher package
         run: npm publish ./npm/rift-snapshot --provenance

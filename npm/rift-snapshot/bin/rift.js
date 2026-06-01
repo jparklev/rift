@@ -4,9 +4,8 @@ import childProcess from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { createRequire } from "node:module"
+import { fileURLToPath } from "node:url"
 
-const require = createRequire(import.meta.url)
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
 
@@ -15,23 +14,11 @@ if (!platform || !arch) {
   process.exit(1)
 }
 
-const name = `rift-${platform}-${arch}`
-let binary
-try {
-  const manifest = require.resolve(`${name}/package.json`)
-  binary = path.join(path.dirname(manifest), "bin", platform === "windows" ? "rift.exe" : "rift")
-} catch {
-  console.error(`Unable to locate ${name}. Reinstall rift-snapshot with optional dependencies enabled.`)
+const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+const binary = path.join(root, "prebuilds", `${platform}-${arch}`, platform === "windows" ? "rift.exe" : "rift")
+if (!fs.existsSync(binary)) {
+  console.error(`Unable to locate the Rift binary for ${platform}-${arch}. Reinstall rift-snapshot.`)
   process.exit(1)
-}
-
-if (platform !== "windows") {
-  try {
-    fs.chmodSync(binary, 0o755)
-  } catch (error) {
-    console.error(`Unable to make the Rift binary executable: ${error.message}`)
-    process.exit(1)
-  }
 }
 
 const result = childProcess.spawnSync(binary, process.argv.slice(2), {

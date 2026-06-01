@@ -11,8 +11,16 @@
   "bin": {
     "rift": "bin/rift.js"
   },
+  "exports": {
+    "./bun": {
+      "types": "./bun/index.d.ts",
+      "default": "./bun/index.js"
+    }
+  },
   "files": [
-    "bin"
+    "bin",
+    "bun",
+    "prebuilds"
   ],
   "os": [
     "darwin",
@@ -23,12 +31,6 @@
     "arm64",
     "x64"
   ],
-  "optionalDependencies": {
-    "rift-darwin-arm64": "0.0.5",
-    "rift-darwin-x64": "0.0.5",
-    "rift-linux-x64": "0.0.5",
-    "rift-windows-x64": "0.0.5"
-  },
   "publishConfig": {
     "provenance": true
   }
