@@ -1,6 +1,6 @@
 {
   "name": "rift-snapshot-darwin-x64",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Rift native binary for macOS x64",
   "license": "MIT",
   "repository": {
