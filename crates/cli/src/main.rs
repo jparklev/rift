@@ -13,6 +13,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Init {
+        at: Option<PathBuf>,
+    },
     Create {
         from: Option<PathBuf>,
         #[arg(long)]
@@ -21,19 +24,22 @@ enum Command {
         into: Option<PathBuf>,
     },
     Remove {
-        at: PathBuf,
+        at: Option<PathBuf>,
+        #[arg(long)]
+        all: bool,
     },
     Link {
-        at: PathBuf,
+        at: Option<PathBuf>,
         #[arg(long)]
         to: Option<PathBuf>,
     },
-    Children {
-        of: PathBuf,
+    List {
+        of: Option<PathBuf>,
     },
     Ancestors {
-        of: PathBuf,
+        of: Option<PathBuf>,
     },
+    Gc,
 }
 
 fn main() {
@@ -50,6 +56,23 @@ fn run() -> rift::Result<()> {
         None => Manager::open_default()?,
     };
     match cli.command {
+        Command::Init { at } => {
+            let at = at.unwrap_or(std::env::current_dir()?);
+            let at = std::fs::canonicalize(at)?;
+            let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
+            if let Some(backup) = manager.init(&at)? {
+                println!(
+                    "initialized btrfs subvolume; original workspace retained at {}",
+                    backup.display()
+                );
+                if initialized_from_inside {
+                    println!(
+                        "run `cd {}` to enter the initialized workspace",
+                        at.display()
+                    );
+                }
+            }
+        }
         Command::Create { from, name, into } => {
             println!(
                 "{}",
@@ -62,15 +85,32 @@ fn run() -> rift::Result<()> {
                     .display()
             );
         }
-        Command::Remove { at } => manager.remove(at)?,
-        Command::Link { at, to } => manager.link(Link { at, to })?,
-        Command::Children { of } => {
-            for path in manager.children(of)? {
+        Command::Remove { at, all } => {
+            let at = at.unwrap_or(std::env::current_dir()?);
+            if all {
+                for path in manager.remove_all(at)? {
+                    println!("{}", path.display());
+                }
+            } else {
+                manager.remove(at)?;
+            }
+        }
+        Command::Link { at, to } => manager.link(Link {
+            at: at.unwrap_or(std::env::current_dir()?),
+            to,
+        })?,
+        Command::List { of } => {
+            for path in manager.list(of.unwrap_or(std::env::current_dir()?))? {
                 println!("{}", path.display());
             }
         }
         Command::Ancestors { of } => {
-            for path in manager.ancestors(of)? {
+            for path in manager.ancestors(of.unwrap_or(std::env::current_dir()?))? {
+                println!("{}", path.display());
+            }
+        }
+        Command::Gc => {
+            for path in manager.gc()? {
                 println!("{}", path.display());
             }
         }

@@ -2,6 +2,7 @@ mod copy;
 mod git;
 
 use copy::{CopyStrategy, CowStrategy};
+use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ pub enum Error {
     Path(String),
     #[error("copy-on-write cloning unavailable: {0}")]
     CowUnavailable(String),
+    #[error("workspace is not a btrfs subvolume: {0}; run `rift init {0}` first")]
+    InitializationRequired(PathBuf),
     #[error("unsupported filesystem entry: {0}")]
     UnsupportedEntry(PathBuf),
     #[error("unsafe Git source: {0}")]
@@ -91,8 +94,13 @@ impl Manager {
                parent_id TEXT REFERENCES rift(id) ON DELETE CASCADE,
                path TEXT NOT NULL UNIQUE,
                created_at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS rift_parent_id_idx ON rift(parent_id);",
+              );
+              CREATE INDEX IF NOT EXISTS rift_parent_id_idx ON rift(parent_id);
+              CREATE TABLE IF NOT EXISTS trash (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                removed_at INTEGER NOT NULL
+              );",
         )?;
         Ok(Self { database, copier })
     }
@@ -107,7 +115,7 @@ impl Manager {
             Some(path) => absolute_path(&path)?,
             None => default_storage(&root.path)?,
         };
-        let name = destination_name(input.name, &id)?;
+        let name = destination_name(input.name)?;
         if destination_parent.join(&name).starts_with(&from) {
             return Err(Error::InsideSource(destination_parent.join(name)));
         }
@@ -122,7 +130,9 @@ impl Manager {
         }
 
         if let Err(error) = self.copier.copy_directory(&from, &destination) {
-            let _ = fs::remove_dir_all(&destination);
+            if destination.exists() {
+                let _ = self.copier.remove_directory(&destination);
+            }
             return Err(error);
         }
 
@@ -149,7 +159,41 @@ impl Manager {
             Ok(destination.clone())
         })();
         if result.is_err() {
-            let _ = fs::remove_dir_all(&destination);
+            let _ = self.copier.remove_directory(&destination);
+        }
+        result
+    }
+
+    pub fn init(&mut self, at: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+        let at = existing_directory(at.as_ref())?;
+        let git = git::check_source(&at)?;
+        if let Some(record) = self.record_at_optional(&at)? {
+            verify_marker(&record)?;
+            let backup = self.copier.initialize_directory(&at)?;
+            if git {
+                git::hide_marker(&at)?;
+            }
+            return Ok(backup);
+        }
+        if read_marker(&at)?.is_some() {
+            return Err(Error::MarkerMismatch(at));
+        }
+
+        let backup = self.copier.initialize_directory(&at)?;
+        let id = Ulid::new().to_string();
+        let result = (|| {
+            write_marker(&at, &id)?;
+            if git {
+                git::hide_marker(&at)?;
+            }
+            self.database.execute(
+                "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, NULL, ?2, ?3)",
+                params![id, path_text(&at)?, timestamp()],
+            )?;
+            Ok(backup.clone())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(marker(&at));
         }
         result
     }
@@ -161,25 +205,42 @@ impl Manager {
             return Err(Error::CannotRemoveRoot(at));
         }
         verify_marker(&record)?;
+        let rows = self.subtree(&record.id, true)?;
+        self.trash_rows(&rows)?;
+        Ok(())
+    }
+
+    pub fn remove_all(&mut self, at: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+        let at = existing_directory(at.as_ref())?;
+        let record = self.record_at(&at)?;
+        verify_marker(&record)?;
+        let rows = self.subtree(&record.id, false)?;
+        self.trash_rows(&rows)?;
+        Ok(rows.into_iter().map(|(_, path)| path).collect())
+    }
+
+    fn subtree(&self, id: &str, include_root: bool) -> Result<Vec<(String, PathBuf)>> {
         let mut statement = self.database.prepare(
             "WITH RECURSIVE subtree(id, path, depth) AS (
                SELECT id, path, 0 FROM rift WHERE id = ?1
                UNION ALL
                SELECT rift.id, rift.path, subtree.depth + 1
                FROM rift JOIN subtree ON rift.parent_id = subtree.id
-             ) SELECT id, path, depth FROM subtree ORDER BY depth DESC",
+             ) SELECT id, path FROM subtree WHERE depth >= ?2 ORDER BY depth DESC, id",
         )?;
         let rows = statement
-            .query_map([&record.id], |row| {
+            .query_map(params![id, if include_root { 0 } else { 1 }], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     PathBuf::from(row.get::<_, String>(1)?),
-                    row.get::<_, i64>(2)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        for (id, path, _) in &rows {
+        Ok(rows)
+    }
+
+    fn trash_rows(&mut self, rows: &[(String, PathBuf)]) -> Result<()> {
+        for (id, path) in rows {
             if !path.exists() {
                 return Err(Error::MissingRift(path.clone()));
             }
@@ -189,12 +250,44 @@ impl Manager {
                 path: path.clone(),
             })?;
         }
-        for (id, path, _) in &rows {
-            fs::remove_dir_all(path)?;
-            self.database
-                .execute("DELETE FROM rift WHERE id = ?1", [id])?;
+        let targets = rows
+            .iter()
+            .map(|(id, path)| Ok((id, path, trash_path(id, path)?)))
+            .collect::<Result<Vec<_>>>()?;
+        for (_, _, trash) in &targets {
+            if trash.exists() {
+                return Err(Error::AlreadyExists(trash.clone()));
+            }
         }
-        Ok(())
+        let mut moved = Vec::with_capacity(rows.len());
+        for (id, path, trash) in targets {
+            fs::create_dir_all(trash.parent().unwrap())?;
+            if let Err(error) = fs::rename(path, &trash) {
+                for (_, original, trashed) in moved.iter().rev() {
+                    let _ = fs::rename(trashed, original);
+                }
+                return Err(error.into());
+            }
+            moved.push((id, path, trash));
+        }
+        let result = (|| {
+            let transaction = self.database.transaction()?;
+            for (id, _, path) in &moved {
+                transaction.execute(
+                    "INSERT INTO trash (id, path, removed_at) VALUES (?1, ?2, ?3)",
+                    params![id, path_text(path)?, timestamp()],
+                )?;
+                transaction.execute("DELETE FROM rift WHERE id = ?1", [id])?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            for (_, original, trashed) in moved.iter().rev() {
+                let _ = fs::rename(trashed, original);
+            }
+        }
+        result
     }
 
     pub fn link(&mut self, input: Link) -> Result<()> {
@@ -244,7 +337,7 @@ impl Manager {
         Ok(())
     }
 
-    pub fn children(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    pub fn list(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let record = self.record_at(&existing_directory(of.as_ref())?)?;
         let mut statement = self
             .database
@@ -268,6 +361,31 @@ impl Manager {
             parent_id = parent.parent_id;
         }
         Ok(paths)
+    }
+
+    pub fn gc(&mut self) -> Result<Vec<PathBuf>> {
+        let mut statement = self
+            .database
+            .prepare("SELECT id, path FROM trash ORDER BY removed_at, id")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut removed = Vec::new();
+        for (id, path) in rows {
+            if path.exists() {
+                self.copier.remove_directory(&path)?;
+            }
+            self.database
+                .execute("DELETE FROM trash WHERE id = ?1", [&id])?;
+            removed.push(path);
+        }
+        Ok(removed)
     }
 
     fn source(&self, path: &Path) -> Result<(Record, bool)> {
@@ -387,13 +505,47 @@ fn default_storage(root: &Path) -> Result<PathBuf> {
     Ok(parent.join(".rifts").join(name))
 }
 
-fn destination_name(name: Option<String>, id: &str) -> Result<String> {
-    let name = name.unwrap_or_else(|| id.to_owned());
+fn trash_path(id: &str, path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Path(format!("rift has no parent: {}", path.display())))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Path(format!("rift has no name: {}", path.display())))?;
+    Ok(parent
+        .join(".trash")
+        .join(format!("{id}-{}", name.to_string_lossy())))
+}
+
+fn destination_name(name: Option<String>) -> Result<String> {
+    let name = name.unwrap_or_else(generated_name);
     if name.is_empty() || name == "." || name == ".." || Path::new(&name).components().count() != 1
     {
         return Err(Error::Path(format!("invalid rift name: {name}")));
     }
     Ok(name)
+}
+
+fn generated_name() -> String {
+    const ADJECTIVES: &[&str] = &[
+        "amber", "bold", "brisk", "calm", "cedar", "clear", "cobalt", "coral", "dawn", "ember",
+        "gentle", "golden", "jade", "lively", "lunar", "mellow", "misty", "noble", "quiet",
+        "rapid", "river", "silver", "solar", "spruce", "steady", "swift", "tidal", "verdant",
+        "violet", "warm", "wild", "winter",
+    ];
+    const NOUNS: &[&str] = &[
+        "badger", "brook", "canyon", "cedar", "comet", "dune", "falcon", "field", "forest",
+        "harbor", "heron", "island", "lantern", "maple", "meadow", "mesa", "otter", "peak", "pine",
+        "reef", "ridge", "robin", "sparrow", "summit", "thicket", "trail", "valley", "willow",
+        "wren", "yarrow", "zephyr", "fox",
+    ];
+
+    let mut rng = rand::rng();
+    format!(
+        "{}-{}",
+        ADJECTIVES[rng.random_range(0..ADJECTIVES.len())],
+        NOUNS[rng.random_range(0..NOUNS.len())]
+    )
 }
 
 fn marker(path: &Path) -> PathBuf {
@@ -477,12 +629,57 @@ mod tests {
             fs::read_to_string(source.join(".rift")).unwrap(),
             fs::read_to_string(first.join(".rift")).unwrap()
         );
-        assert_eq!(manager.children(&source).unwrap(), vec![first.clone()]);
+        assert_eq!(manager.list(&source).unwrap(), vec![first.clone()]);
         assert_eq!(manager.ancestors(&second).unwrap(), vec![first, source]);
     }
 
     #[test]
-    fn remove_deletes_a_full_subtree() {
+    fn init_registers_a_root_workspace_without_creating_a_child() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+
+        assert!(manager.init(&source).unwrap().is_none());
+        assert!(source.join(".rift").exists());
+        assert!(manager.list(&source).unwrap().is_empty());
+        assert!(manager.init(&source).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_generates_readable_names_independent_of_ulid_identity() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+
+        let destination = manager
+            .create(Create {
+                from: source,
+                name: None,
+                into: None,
+            })
+            .unwrap();
+        let name = destination.file_name().unwrap().to_str().unwrap();
+        let parts = name.split('-').collect::<Vec<_>>();
+        let id = fs::read_to_string(destination.join(".rift")).unwrap();
+        let id = id.trim();
+
+        assert_eq!(parts.len(), 2);
+        assert!(
+            parts[0]
+                .chars()
+                .all(|character| character.is_ascii_lowercase())
+        );
+        assert!(
+            parts[1]
+                .chars()
+                .all(|character| character.is_ascii_lowercase())
+        );
+        assert!(Ulid::from_string(id).is_ok());
+        assert_ne!(name, id);
+    }
+
+    #[test]
+    fn remove_trashes_a_full_subtree_and_gc_deletes_it() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
@@ -501,11 +698,36 @@ mod tests {
             })
             .unwrap();
 
+        let first_trash = trash_path(
+            &fs::read_to_string(first.join(".rift"))
+                .unwrap()
+                .trim()
+                .to_owned(),
+            &first,
+        )
+        .unwrap();
+        let second_trash = trash_path(
+            &fs::read_to_string(second.join(".rift"))
+                .unwrap()
+                .trim()
+                .to_owned(),
+            &second,
+        )
+        .unwrap();
+
         manager.remove(&first).unwrap();
 
         assert!(!first.exists());
         assert!(!second.exists());
-        assert!(manager.children(&source).unwrap().is_empty());
+        assert!(first_trash.exists());
+        assert!(second_trash.exists());
+        assert!(manager.list(&source).unwrap().is_empty());
+        let deleted = manager.gc().unwrap();
+        assert!(deleted.contains(&second_trash));
+        assert!(deleted.contains(&first_trash));
+        assert_eq!(deleted.len(), 2);
+        assert!(!first_trash.exists());
+        assert!(!second_trash.exists());
         assert!(matches!(
             manager.remove(&source),
             Err(Error::CannotRemoveRoot(_))
@@ -513,7 +735,47 @@ mod tests {
     }
 
     #[test]
-    fn remove_refuses_a_subtree_with_an_unlinked_move() {
+    fn remove_all_deletes_descendants_and_preserves_the_selected_workspace() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        let sibling = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("sibling".into()),
+                into: None,
+            })
+            .unwrap();
+        let first_id = fs::read_to_string(first.join(".rift")).unwrap();
+        let first_trash = trash_path(first_id.trim(), &first).unwrap();
+
+        let removed = manager.remove_all(&source).unwrap();
+        assert_eq!(removed[0], second);
+        assert!(removed.contains(&first));
+        assert!(removed.contains(&sibling));
+        assert_eq!(removed.len(), 3);
+        assert!(source.exists());
+        assert!(!first.exists());
+        assert!(first_trash.exists());
+        assert!(manager.list(&source).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_all_preserves_a_nested_selected_rift() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
@@ -531,10 +793,90 @@ mod tests {
                 into: None,
             })
             .unwrap();
+
+        assert_eq!(manager.remove_all(&first).unwrap(), vec![second]);
+        assert!(first.exists());
+        assert!(manager.list(&first).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_refuses_a_subtree_with_an_unlinked_move() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
         fs::rename(&second, temp.path().join("moved")).unwrap();
 
         assert!(matches!(manager.remove(&first), Err(Error::MissingRift(_))));
         assert!(first.exists());
+    }
+
+    #[test]
+    fn gc_removes_trashed_entries() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        let first_id = fs::read_to_string(first.join(".rift")).unwrap();
+        let second_id = fs::read_to_string(second.join(".rift")).unwrap();
+        let first_trash = trash_path(first_id.trim(), &first).unwrap();
+        let second_trash = trash_path(second_id.trim(), &second).unwrap();
+        manager.remove(&first).unwrap();
+
+        let deleted = manager.gc().unwrap();
+        assert!(deleted.contains(&second_trash));
+        assert!(deleted.contains(&first_trash));
+        assert_eq!(deleted.len(), 2);
+        assert!(manager.list(&source).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_has_no_effect_on_active_rifts() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        assert!(manager.gc().unwrap().is_empty());
+        assert_eq!(manager.ancestors(&second).unwrap(), vec![first, source]);
     }
 
     #[test]
@@ -628,6 +970,12 @@ mod tests {
             })
             .unwrap();
 
+        let source_commit = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .output()
+            .unwrap();
         assert!(
             !Command::new("git")
                 .arg("-C")
@@ -636,6 +984,13 @@ mod tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(".git/HEAD")).unwrap(),
+            format!(
+                "{}\n",
+                String::from_utf8_lossy(&source_commit.stdout).trim()
+            )
         );
         let staged = Command::new("git")
             .arg("-C")

@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 dirs.workspace = true
-filetime.workspace = true
 libc.workspace = true
+rand.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 ulid.workspace = true

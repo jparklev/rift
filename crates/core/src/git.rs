@@ -53,23 +53,15 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn detach_destination(path: &Path) -> Result<()> {
-    let head = Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--verify", "HEAD^{commit}"])
         .output()?;
-    if !head.status.success() {
+    if !output.status.success() {
         return Ok(());
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["switch", "--detach", "--quiet", "HEAD"])
-        .output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(Error::UnsafeGit(
-        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    ))
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    fs::write(path.join(".git").join("HEAD"), format!("{commit}\n"))?;
+    Ok(())
 }

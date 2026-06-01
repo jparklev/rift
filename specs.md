@@ -2,9 +2,25 @@
 
 ## Requirement
 
-`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. Copy-on-write is a platform/filesystem acceleration and must not define the product model.
+`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. On Linux, managed workspaces are btrfs subvolumes so creation uses instantaneous writable snapshots rather than tree traversal.
 
 ## API
+
+### `init`
+
+```ts
+init(input: {
+  at: AbsolutePath
+}): AbsolutePath | undefined
+```
+
+`init` prepares and registers an original workspace for Rift.
+
+- On Linux, `at` must be on btrfs.
+- If `at` is already a btrfs subvolume, register it without replacing it.
+- If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume, swap the new subvolume into its original path, and return the retained backup path.
+- The retained backup is not registered as a workspace and remains for explicit user cleanup.
+- The CLI defaults `at` to the current working directory and may be run from within that workspace; after a conversion it tells the caller to re-enter the original path.
 
 ### `create`
 
@@ -19,11 +35,13 @@ create(input: {
 Default behavior:
 
 - Source is `from`.
-- `name` defaults to a generated directory name.
+- `name` defaults to a random adjective-noun directory name independent of the rift ULID.
 - `into` defaults to the managed rift directory.
 - Copy the whole workspace, including dirty, staged, untracked, and ignored files.
 - Detach `HEAD` in the new workspace.
 - Return the path of the new workspace.
+
+On Linux, `from` must already be a btrfs subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first.
 
 If `from` is already managed by Rift, create copies that exact directory. Do not resolve back to an earlier workspace. Metadata should record the immediate source rift as its parent.
 
@@ -46,16 +64,19 @@ Default storage is a hidden sibling directory of the original registered workspa
 ```ts
 remove(input: {
   at: AbsolutePath
+  all?: boolean
 }): void
 ```
 
-`remove` deletes a managed rift and its full descendant subtree.
+`remove` logically deletes a managed rift and its full descendant subtree immediately by moving them into Rift-owned trash.
 
 - `at` must identify a rift created by this tool; the registered source root cannot be removed.
-- Resolve all descendants through `parent_id` and remove their directories deepest-first.
+- When `all` is true, preserve `at` and delete every managed descendant. In this mode `at` may be the registered source root.
+- Resolve all descendants through `parent_id` and move their directories deepest-first.
 - Verify each existing directory's `.rift` marker before deleting it.
 - Refuse removal if any descendant path is missing, because it may be a moved workspace that has not been linked yet.
-- After successful filesystem removal, delete the subtree records from the database.
+- Move each removed rift from `<storage-parent>/<name>` to `<storage-parent>/.trash/<id>-<name>` so custom `into` storage remains on the same filesystem.
+- After successful filesystem moves, delete the active tree records and insert trash records for garbage collection.
 
 ### `link`
 
@@ -80,15 +101,15 @@ link(input: {
 - Refuse `to` for an original registered workspace; only rifts created by this tool can be reparented.
 - Refuse `to` if it is `at` or a descendant of `at`, because reparenting must not create a cycle.
 
-### `children`
+### `list`
 
 ```ts
-children(input: {
+list(input: {
   of: AbsolutePath
 }): AbsolutePath[]
 ```
 
-`children` returns the direct managed rifts created from `of`.
+`list` returns the direct active managed rifts created from `of`.
 
 ### `ancestors`
 
@@ -99,6 +120,18 @@ ancestors(input: {
 ```
 
 `ancestors` returns the managed ancestry of `of`, ordered from its immediate parent to the root workspace.
+
+### `gc`
+
+```ts
+gc(): AbsolutePath[]
+```
+
+`gc` physically deletes rifts previously moved into Rift-owned trash and returns deleted trash paths for CLI output.
+
+- On Linux, attempt immediate btrfs subvolume deletion first.
+- If standard mount permissions deny deletion of a populated subvolume, delete its contents and remove the now-empty subvolume with ordinary directory removal.
+- Delete each trash registry record after its filesystem directory is successfully removed.
 
 ## Metadata
 
@@ -117,6 +150,12 @@ CREATE TABLE rift (
 );
 
 CREATE INDEX rift_parent_id_idx ON rift(parent_id);
+
+CREATE TABLE trash (
+  id TEXT PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE,
+  removed_at INTEGER NOT NULL
+);
 ```
 
 - Every managed rift has a stable generated `id`.
@@ -128,7 +167,7 @@ CREATE INDEX rift_parent_id_idx ON rift(parent_id);
 - A created rift has `parent_id` set to the source rift `id`.
 - `path` is its current location, not its identity.
 - Provenance is a rooted tree. Descendants of any rift can be listed through recursive queries over `parent_id`.
-- `remove` deletes a whole subtree, so no surviving record depends on deleted ancestry.
+- `remove` moves a whole active subtree into trash, so no surviving active record depends on deleted ancestry.
 
 ### Moved Rifts
 
@@ -162,7 +201,8 @@ The tool does not create branches, commit changes, or otherwise replace normal G
 
 Copying is implemented behind a strategy boundary so platform-specific copy-on-write backends can be added independently.
 
-- The production strategy on Linux uses reflink cloning.
+- The production strategy on Linux uses writable btrfs subvolume snapshots.
+- Linux `init` performs a single reflink import only when converting an existing ordinary btrfs workspace into a subvolume; `create` never performs file-by-file cloning.
 - The production strategy on macOS uses APFS `clonefile` directory cloning.
 - If no implemented copy-on-write strategy succeeds, `create` fails.
 - Full byte copying is not implemented as a fallback.
@@ -179,4 +219,4 @@ The project ships four interfaces backed by the same implementation and metadata
 
 The CLI and language bindings should remain thin and expose the same API semantics as the native library.
 
-For CLI ergonomics, `rift create` defaults `from` to the current working directory when no source path is provided.
+For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift link`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted.
