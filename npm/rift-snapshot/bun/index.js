@@ -1,17 +1,22 @@
 import { CString, dlopen, ptr } from "bun:ffi"
-import fs from "node:fs"
 import os from "node:os"
-import path from "node:path"
-import { fileURLToPath } from "node:url"
 
 const platform = { darwin: "darwin", linux: "linux", win32: "windows" }[os.platform()]
 const arch = { arm64: "arm64", x64: "x64" }[os.arch()]
 if (!platform || !arch) throw new Error(`Unsupported Rift platform: ${os.platform()}-${os.arch()}`)
 
-const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const libraryName = platform === "windows" ? "rift_ffi.dll" : platform === "darwin" ? "librift_ffi.dylib" : "librift_ffi.so"
-const libraryPath = path.join(root, "prebuilds", `${platform}-${arch}`, libraryName)
-if (!fs.existsSync(libraryPath)) throw new Error(`Unable to locate the Rift Bun library for ${platform}-${arch}. Reinstall rift-snapshot.`)
+let libraryPath
+if (platform === "linux" && arch === "x64") {
+  libraryPath = (await import("../prebuilds/linux-x64/librift_ffi.so", { with: { type: "file" } })).default
+} else if (platform === "darwin" && arch === "x64") {
+  libraryPath = (await import("../prebuilds/darwin-x64/librift_ffi.dylib", { with: { type: "file" } })).default
+} else if (platform === "darwin" && arch === "arm64") {
+  libraryPath = (await import("../prebuilds/darwin-arm64/librift_ffi.dylib", { with: { type: "file" } })).default
+} else if (platform === "windows" && arch === "x64") {
+  libraryPath = (await import("../prebuilds/windows-x64/rift_ffi.dll", { with: { type: "file" } })).default
+} else {
+  throw new Error(`Unsupported Rift platform: ${platform}-${arch}`)
+}
 
 const { symbols } = dlopen(libraryPath, {
   rift_ffi_call: { args: ["ptr"], returns: "ptr" },
