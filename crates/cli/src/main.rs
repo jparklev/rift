@@ -150,20 +150,26 @@ fn run() -> rift::Result<()> {
 }
 
 fn print_shell_init(_shell: Shell) {
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rift"));
+    let executable = shell_quote(&executable.to_string_lossy());
     println!(
         r#"rift() {{
   case "${{1-}}" in
     init|create|remove)
       local __rift_cwd
-      __rift_cwd="$(command rift --shell-cwd "$@")" || return $?
+      __rift_cwd="$({executable} --shell-cwd "$@")" || return $?
       if [ -n "$__rift_cwd" ]; then
         builtin cd -- "$__rift_cwd" || return $?
       fi
       ;;
     *)
-      command rift "$@"
+      {executable} "$@"
       ;;
   esac
-}}"#
+}}"#,
     );
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
