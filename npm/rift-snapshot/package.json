@@ -1,6 +1,6 @@
 {
   "name": "rift-snapshot",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Fast copy-on-write development workspaces",
   "license": "MIT",
   "repository": {
@@ -24,10 +24,10 @@
     "x64"
   ],
   "optionalDependencies": {
-    "rift-snapshot-darwin-arm64": "0.0.3",
-    "rift-snapshot-darwin-x64": "0.0.3",
-    "rift-snapshot-linux-x64": "0.0.3",
-    "rift-snapshot-windows-x64": "0.0.3"
+    "rift-snapshot-darwin-arm64": "0.0.4",
+    "rift-snapshot-darwin-x64": "0.0.4",
+    "rift-snapshot-linux-x64": "0.0.4",
+    "rift-snapshot-windows-x64": "0.0.4"
   },
   "publishConfig": {
     "provenance": true
