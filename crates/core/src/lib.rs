@@ -1,13 +1,17 @@
 mod git;
+mod id;
+mod marker;
+mod name;
+mod registry;
 mod strategy;
 
-use rand::Rng;
-use rusqlite::{Connection, OptionalExtension, params};
+use id::RiftId;
+use name::RiftName;
+use registry::{MovedRecord, PathRecord, Record, Registry, SubtreeScope};
 use std::fs;
 use std::path::{Path, PathBuf};
 use strategy::{Strategy, StrategyInit};
 use thiserror::Error;
-use ulid::Ulid;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -77,15 +81,8 @@ impl InitOutcome {
     }
 }
 
-#[derive(Clone)]
-struct Record {
-    id: String,
-    parent_id: Option<String>,
-    path: PathBuf,
-}
-
 pub struct Manager {
-    database: Connection,
+    registry: Registry,
     strategy: Box<dyn Strategy>,
 }
 
@@ -103,23 +100,8 @@ impl Manager {
     }
 
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
-        let database = Connection::open(path)?;
-        database.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS rift (
-               id TEXT PRIMARY KEY,
-               parent_id TEXT REFERENCES rift(id) ON DELETE CASCADE,
-               path TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL
-              );
-              CREATE INDEX IF NOT EXISTS rift_parent_id_idx ON rift(parent_id);
-              CREATE TABLE IF NOT EXISTS trash (
-                id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                removed_at INTEGER NOT NULL
-              );",
-        )?;
-        Ok(Self { database, strategy })
+        let registry = Registry::open(path)?;
+        Ok(Self { registry, strategy })
     }
 
     pub fn create(&mut self, input: Create) -> Result<PathBuf> {
@@ -128,18 +110,18 @@ impl Manager {
         let from = source.path.clone();
         let git = git::check_source(&from)?;
         let root = self.root(&source)?;
-        let id = Ulid::new().to_string();
+        let id = RiftId::new();
         let destination_parent = match input.into {
             Some(path) => absolute_path(&path)?,
             None => default_storage(&root.path)?,
         };
-        let name = destination_name(input.name)?;
-        if destination_parent.join(&name).starts_with(&from) {
-            return Err(Error::InsideSource(destination_parent.join(name)));
+        let name = RiftName::from_optional(input.name)?;
+        if destination_parent.join(name.as_str()).starts_with(&from) {
+            return Err(Error::InsideSource(destination_parent.join(name.as_str())));
         }
         fs::create_dir_all(&destination_parent)?;
         let destination_parent = fs::canonicalize(destination_parent)?;
-        let destination = destination_parent.join(name);
+        let destination = destination_parent.join(name.as_str());
         if destination.starts_with(&from) {
             return Err(Error::InsideSource(destination));
         }
@@ -155,7 +137,7 @@ impl Manager {
         }
 
         let result = (|| {
-            write_marker(&destination, &id)?;
+            marker::write(&destination, &id)?;
             if git.is_repository() {
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
@@ -163,10 +145,7 @@ impl Manager {
             if git.is_repository() {
                 git::hide_marker(&from)?;
             }
-            self.database.execute(
-                "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![id, source.id, path_text(&destination)?, timestamp()],
-            )?;
+            self.registry.insert_child(&id, &source.id, &destination)?;
             Ok(destination.clone())
         })();
         if result.is_err() {
@@ -186,12 +165,12 @@ impl Manager {
     ) -> Result<InitOutcome> {
         let at = existing_directory(at.as_ref())?;
         let git = git::check_source(&at)?;
-        if let Some(record) = self.record_at_optional(&at)? {
-            if read_marker(&at)?.is_none() {
+        if let Some(record) = self.registry.record_at(&at)? {
+            if marker::read(&at)?.is_none() {
                 progress(InitProgress::RestoringMarker);
-                write_marker(&at, &record.id)?;
+                marker::write(&at, &record.id)?;
             } else {
-                verify_marker(&record)?;
+                marker::verify(&record.path, &record.id)?;
             }
             let converted = self.strategy.initialize_directory(&at, &mut progress)?;
             if git.is_repository() {
@@ -202,29 +181,26 @@ impl Manager {
                 StrategyInit::Converted => InitOutcome::Converted,
             });
         }
-        if read_marker(&at)?.is_some() {
+        if marker::read(&at)?.is_some() {
             return Err(Error::MarkerMismatch(at));
         }
 
         let converted = self.strategy.initialize_directory(&at, &mut progress)?;
         progress(InitProgress::RegisteringWorkspace);
-        let id = Ulid::new().to_string();
+        let id = RiftId::new();
         let result = (|| {
-            write_marker(&at, &id)?;
+            marker::write(&at, &id)?;
             if git.is_repository() {
                 git::hide_marker(&at)?;
             }
-            self.database.execute(
-                "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, NULL, ?2, ?3)",
-                params![id, path_text(&at)?, timestamp()],
-            )?;
+            self.registry.insert_root(&id, &at)?;
             Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::Registered,
                 StrategyInit::Converted => InitOutcome::Converted,
             })
         })();
         if result.is_err() {
-            let _ = fs::remove_file(marker(&at));
+            let _ = fs::remove_file(marker::path(&at));
         }
         result
     }
@@ -234,100 +210,82 @@ impl Manager {
         if record.parent_id.is_none() {
             return self.unregister_root(&record);
         }
-        verify_marker(&record)?;
-        let rows = self.subtree(&record.id, true)?;
+        marker::verify(&record.path, &record.id)?;
+        let rows = self
+            .registry
+            .subtree(&record.id, SubtreeScope::IncludingRoot)?;
         self.trash_rows(&rows)?;
         Ok(())
     }
 
     pub fn remove_all(&mut self, at: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let record = self.workspace_at(at)?;
-        verify_marker(&record)?;
-        let rows = self.subtree(&record.id, false)?;
+        marker::verify(&record.path, &record.id)?;
+        let rows = self
+            .registry
+            .subtree(&record.id, SubtreeScope::DescendantsOnly)?;
         self.trash_rows(&rows)?;
-        Ok(rows.into_iter().map(|(_, path)| path).collect())
+        Ok(rows.into_iter().map(|record| record.path).collect())
     }
 
     fn unregister_root(&mut self, record: &Record) -> Result<()> {
-        verify_marker(record)?;
-        let rows = self.subtree(&record.id, false)?;
+        marker::verify(&record.path, &record.id)?;
+        let rows = self
+            .registry
+            .subtree(&record.id, SubtreeScope::DescendantsOnly)?;
         let existing = rows
             .into_iter()
-            .filter(|(_, path)| path.exists())
+            .filter(|record| record.path.exists())
             .collect::<Vec<_>>();
         self.trash_rows(&existing)?;
-        fs::remove_file(marker(&record.path))?;
-        self.database
-            .execute("DELETE FROM rift WHERE id = ?1", [&record.id])?;
+        fs::remove_file(marker::path(&record.path))?;
+        self.registry.delete_active(&record.id)?;
         Ok(())
     }
 
-    fn subtree(&self, id: &str, include_root: bool) -> Result<Vec<(String, PathBuf)>> {
-        let mut statement = self.database.prepare(
-            "WITH RECURSIVE subtree(id, path, depth) AS (
-               SELECT id, path, 0 FROM rift WHERE id = ?1
-               UNION ALL
-               SELECT rift.id, rift.path, subtree.depth + 1
-               FROM rift JOIN subtree ON rift.parent_id = subtree.id
-             ) SELECT id, path FROM subtree WHERE depth >= ?2 ORDER BY depth DESC, id",
-        )?;
-        let rows = statement
-            .query_map(params![id, if include_root { 0 } else { 1 }], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    fn trash_rows(&mut self, rows: &[(String, PathBuf)]) -> Result<()> {
-        for (id, path) in rows {
-            if !path.exists() {
-                return Err(Error::MissingRift(path.clone()));
+    fn trash_rows(&mut self, rows: &[PathRecord]) -> Result<()> {
+        for row in rows {
+            if !row.path.exists() {
+                return Err(Error::MissingRift(row.path.clone()));
             }
-            verify_marker(&Record {
-                id: id.clone(),
-                parent_id: None,
-                path: path.clone(),
-            })?;
+            marker::verify(&row.path, &row.id)?;
         }
         let targets = rows
             .iter()
-            .map(|(id, path)| Ok((id, path, trash_path(id, path)?)))
+            .map(|row| {
+                Ok(MovedRecord {
+                    id: row.id.clone(),
+                    original_path: row.path.clone(),
+                    trash_path: trash_path(&row.id, &row.path)?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
-        for (_, _, trash) in &targets {
-            if trash.exists() {
-                return Err(Error::AlreadyExists(trash.clone()));
+        for target in &targets {
+            if target.trash_path.exists() {
+                return Err(Error::AlreadyExists(target.trash_path.clone()));
             }
         }
-        let mut moved = Vec::with_capacity(rows.len());
-        for (id, path, trash) in targets {
-            fs::create_dir_all(trash.parent().unwrap())?;
-            if let Err(error) = fs::rename(path, &trash) {
-                for (_, original, trashed) in moved.iter().rev() {
-                    let _ = fs::rename(trashed, original);
+        let mut moved: Vec<MovedRecord> = Vec::with_capacity(rows.len());
+        for target in targets {
+            let trash_parent = target.trash_path.parent().ok_or_else(|| {
+                Error::Path(format!(
+                    "trash path has no parent: {}",
+                    target.trash_path.display()
+                ))
+            })?;
+            fs::create_dir_all(trash_parent)?;
+            if let Err(error) = fs::rename(&target.original_path, &target.trash_path) {
+                for record in moved.iter().rev() {
+                    let _ = fs::rename(&record.trash_path, &record.original_path);
                 }
                 return Err(error.into());
             }
-            moved.push((id, path, trash));
+            moved.push(target);
         }
-        let result = (|| {
-            let transaction = self.database.transaction()?;
-            for (id, _, path) in &moved {
-                transaction.execute(
-                    "INSERT INTO trash (id, path, removed_at) VALUES (?1, ?2, ?3)",
-                    params![id, path_text(path)?, timestamp()],
-                )?;
-                transaction.execute("DELETE FROM rift WHERE id = ?1", [id])?;
-            }
-            transaction.commit()?;
-            Ok(())
-        })();
+        let result = self.registry.trash_moved(&moved);
         if result.is_err() {
-            for (_, original, trashed) in moved.iter().rev() {
-                let _ = fs::rename(trashed, original);
+            for record in moved.iter().rev() {
+                let _ = fs::rename(&record.trash_path, &record.original_path);
             }
         }
         result
@@ -335,14 +293,7 @@ impl Manager {
 
     pub fn list(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let record = self.workspace_at(of)?;
-        let mut statement = self
-            .database
-            .prepare("SELECT path FROM rift WHERE parent_id = ?1 ORDER BY created_at, id")?;
-        Ok(statement
-            .query_map([record.id], |row| {
-                Ok(PathBuf::from(row.get::<_, String>(0)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.registry.child_paths(&record.id)
     }
 
     pub fn ancestors(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
@@ -351,6 +302,7 @@ impl Manager {
         let mut parent_id = record.parent_id;
         while let Some(id) = parent_id {
             let parent = self
+                .registry
                 .record_id(&id)?
                 .ok_or_else(|| Error::NotManaged(record.path.clone()))?;
             paths.push(parent.path);
@@ -360,58 +312,32 @@ impl Manager {
     }
 
     pub fn gc(&mut self) -> Result<Vec<PathBuf>> {
-        let mut statement = self
-            .database
-            .prepare("SELECT id, path FROM trash ORDER BY removed_at, id")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
         let mut removed = Vec::new();
-        for (id, path) in rows {
-            if path.exists() {
-                self.strategy.remove_directory(&path)?;
+        for row in self.registry.trashed_paths()? {
+            if row.path.exists() {
+                self.strategy.remove_directory(&row.path)?;
             }
-            self.database
-                .execute("DELETE FROM trash WHERE id = ?1", [&id])?;
-            removed.push(path);
+            self.registry.delete_trash(&row.id)?;
+            removed.push(row.path);
         }
 
-        let mut statement = self.database.prepare("SELECT id, path FROM rift")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
         let mut missing = Vec::new();
-        for (id, path) in rows {
-            if path.exists() {
+        for row in self.registry.active_paths()? {
+            if row.path.exists() {
                 continue;
             }
             if self
-                .subtree(&id, false)?
+                .registry
+                .subtree(&row.id, SubtreeScope::DescendantsOnly)?
                 .iter()
-                .any(|(_, descendant)| descendant.exists())
+                .any(|descendant| descendant.path.exists())
             {
                 continue;
             }
-            missing.push((id, path));
+            missing.push(row);
         }
-        let transaction = self.database.transaction()?;
-        for (id, path) in missing {
-            transaction.execute("DELETE FROM rift WHERE id = ?1", [&id])?;
-            removed.push(path);
-        }
-        transaction.commit()?;
+        self.registry.delete_active_records(&missing)?;
+        removed.extend(missing.into_iter().map(|record| record.path));
         Ok(removed)
     }
 
@@ -431,8 +357,9 @@ impl Manager {
 
     fn workspace_from_optional(&self, path: &Path) -> Result<Option<Record>> {
         for directory in path.ancestors() {
-            if let Some(id) = read_marker(directory)? {
+            if let Some(id) = marker::read(directory)? {
                 let record = self
+                    .registry
                     .record_id(&id)?
                     .ok_or_else(|| Error::UnknownMarker(directory.to_path_buf()))?;
                 if record.path != directory {
@@ -440,7 +367,7 @@ impl Manager {
                 }
                 return Ok(Some(record));
             }
-            if self.record_at_optional(directory)?.is_some() {
+            if self.registry.record_at(directory)?.is_some() {
                 return Err(Error::MissingMarker(directory.to_path_buf()));
             }
         }
@@ -451,44 +378,11 @@ impl Manager {
         let mut current = record.clone();
         while let Some(id) = current.parent_id.clone() {
             current = self
+                .registry
                 .record_id(&id)?
                 .ok_or_else(|| Error::NotManaged(record.path.clone()))?;
         }
         Ok(current)
-    }
-
-    fn record_at_optional(&self, path: &Path) -> Result<Option<Record>> {
-        self.database
-            .query_row(
-                "SELECT id, parent_id, path FROM rift WHERE path = ?1",
-                [path_text(path)?],
-                |row| {
-                    Ok(Record {
-                        id: row.get(0)?,
-                        parent_id: row.get(1)?,
-                        path: PathBuf::from(row.get::<_, String>(2)?),
-                    })
-                },
-            )
-            .optional()
-            .map_err(Error::from)
-    }
-
-    fn record_id(&self, id: &str) -> Result<Option<Record>> {
-        self.database
-            .query_row(
-                "SELECT id, parent_id, path FROM rift WHERE id = ?1",
-                [id],
-                |row| {
-                    Ok(Record {
-                        id: row.get(0)?,
-                        parent_id: row.get(1)?,
-                        path: PathBuf::from(row.get::<_, String>(2)?),
-                    })
-                },
-            )
-            .optional()
-            .map_err(Error::from)
     }
 }
 
@@ -523,7 +417,7 @@ fn default_storage(root: &Path) -> Result<PathBuf> {
     Ok(parent.join(".rifts").join(name))
 }
 
-fn trash_path(id: &str, path: &Path) -> Result<PathBuf> {
+fn trash_path(id: &RiftId, path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Path(format!("rift has no parent: {}", path.display())))?;
@@ -535,74 +429,6 @@ fn trash_path(id: &str, path: &Path) -> Result<PathBuf> {
         .join(format!("{id}-{}", name.to_string_lossy())))
 }
 
-fn destination_name(name: Option<String>) -> Result<String> {
-    let name = name.unwrap_or_else(generated_name);
-    if name.is_empty() || name == "." || name == ".." || Path::new(&name).components().count() != 1
-    {
-        return Err(Error::Path(format!("invalid rift name: {name}")));
-    }
-    Ok(name)
-}
-
-fn generated_name() -> String {
-    const ADJECTIVES: &[&str] = &[
-        "amber", "bold", "brisk", "calm", "cedar", "clear", "cobalt", "coral", "dawn", "ember",
-        "gentle", "golden", "jade", "lively", "lunar", "mellow", "misty", "noble", "quiet",
-        "rapid", "river", "silver", "solar", "spruce", "steady", "swift", "tidal", "verdant",
-        "violet", "warm", "wild", "winter",
-    ];
-    const NOUNS: &[&str] = &[
-        "badger", "brook", "canyon", "cedar", "comet", "dune", "falcon", "field", "forest",
-        "harbor", "heron", "island", "lantern", "maple", "meadow", "mesa", "otter", "peak", "pine",
-        "reef", "ridge", "robin", "sparrow", "summit", "thicket", "trail", "valley", "willow",
-        "wren", "yarrow", "zephyr", "fox",
-    ];
-
-    let mut rng = rand::rng();
-    format!(
-        "{}-{}",
-        ADJECTIVES[rng.random_range(0..ADJECTIVES.len())],
-        NOUNS[rng.random_range(0..NOUNS.len())]
-    )
-}
-
-fn marker(path: &Path) -> PathBuf {
-    path.join(".rift")
-}
-
-fn write_marker(path: &Path, id: &str) -> Result<()> {
-    fs::write(marker(path), format!("{id}\n"))?;
-    Ok(())
-}
-
-fn read_marker(path: &Path) -> Result<Option<String>> {
-    let marker = marker(path);
-    if !marker.exists() {
-        return Ok(None);
-    }
-    Ok(Some(fs::read_to_string(marker)?.trim().to_owned()))
-}
-
-fn verify_marker(record: &Record) -> Result<()> {
-    if read_marker(&record.path)?.as_deref() == Some(&record.id) {
-        return Ok(());
-    }
-    Err(Error::MarkerMismatch(record.path.clone()))
-}
-
-fn path_text(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| Error::Path(format!("path is not valid UTF-8: {}", path.display())))
-}
-
-fn timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +437,7 @@ mod tests {
     use std::process::Command;
     use std::rc::Rc;
     use tempfile::TempDir;
+    use ulid::Ulid;
 
     fn manager(temp: &TempDir) -> Manager {
         Manager::with_strategy(temp.path().join("registry.sqlite"), Box::new(TestStrategy)).unwrap()
@@ -621,6 +448,10 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("file.txt"), "hello").unwrap();
         fs::canonicalize(source).unwrap()
+    }
+
+    fn marker_id(path: &Path) -> RiftId {
+        marker::read(path).unwrap().unwrap()
     }
 
     #[test]
@@ -747,7 +578,7 @@ mod tests {
             Err(Error::UnknownMarker(_))
         ));
 
-        let id = manager.record_at_optional(&source).unwrap().unwrap().id;
+        let id = manager.registry.record_at(&source).unwrap().unwrap().id;
         fs::write(source.join(".rift"), format!("{id}\n")).unwrap();
         let other = temp.path().join("other");
         fs::create_dir(&other).unwrap();
@@ -771,7 +602,7 @@ mod tests {
                 into: None,
             })
             .unwrap();
-        let id = fs::read_to_string(child.join(".rift")).unwrap();
+        let id = marker_id(&child);
         fs::write(child.join(".rift"), "wrong\n").unwrap();
         assert!(matches!(
             manager.remove(&child),
@@ -786,8 +617,8 @@ mod tests {
             manager.remove(&child),
             Err(Error::MarkerMismatch(_))
         ));
-        fs::write(child.join(".rift"), &id).unwrap();
-        let trash = trash_path(id.trim(), &child).unwrap();
+        fs::write(child.join(".rift"), format!("{id}\n")).unwrap();
+        let trash = trash_path(&id, &child).unwrap();
         fs::create_dir_all(&trash).unwrap();
         assert!(matches!(
             manager.remove(&child),
@@ -808,8 +639,8 @@ mod tests {
                 into: None,
             })
             .unwrap();
-        let id = fs::read_to_string(child.join(".rift")).unwrap();
-        let trash = trash_path(id.trim(), &child).unwrap();
+        let id = marker_id(&child);
+        let trash = trash_path(&id, &child).unwrap();
         manager.remove(&child).unwrap();
         fs::remove_dir_all(&trash).unwrap();
 
@@ -986,22 +817,10 @@ mod tests {
             })
             .unwrap();
 
-        let first_trash = trash_path(
-            &fs::read_to_string(first.join(".rift"))
-                .unwrap()
-                .trim()
-                .to_owned(),
-            &first,
-        )
-        .unwrap();
-        let second_trash = trash_path(
-            &fs::read_to_string(second.join(".rift"))
-                .unwrap()
-                .trim()
-                .to_owned(),
-            &second,
-        )
-        .unwrap();
+        let first_id = marker_id(&first);
+        let first_trash = trash_path(&first_id, &first).unwrap();
+        let second_id = marker_id(&second);
+        let second_trash = trash_path(&second_id, &second).unwrap();
 
         manager.remove(&first).unwrap();
 
@@ -1038,16 +857,10 @@ mod tests {
                 into: None,
             })
             .unwrap();
-        let first_trash = trash_path(
-            fs::read_to_string(first.join(".rift")).unwrap().trim(),
-            &first,
-        )
-        .unwrap();
-        let second_trash = trash_path(
-            fs::read_to_string(second.join(".rift")).unwrap().trim(),
-            &second,
-        )
-        .unwrap();
+        let first_id = marker_id(&first);
+        let first_trash = trash_path(&first_id, &first).unwrap();
+        let second_id = marker_id(&second);
+        let second_trash = trash_path(&second_id, &second).unwrap();
 
         manager.remove(&source).unwrap();
 
@@ -1118,8 +931,8 @@ mod tests {
                 into: None,
             })
             .unwrap();
-        let first_id = fs::read_to_string(first.join(".rift")).unwrap();
-        let first_trash = trash_path(first_id.trim(), &first).unwrap();
+        let first_id = marker_id(&first);
+        let first_trash = trash_path(&first_id, &first).unwrap();
 
         let removed = manager.remove_all(&source).unwrap();
         assert_eq!(removed[0], second);
@@ -1204,10 +1017,10 @@ mod tests {
                 into: None,
             })
             .unwrap();
-        let first_id = fs::read_to_string(first.join(".rift")).unwrap();
-        let second_id = fs::read_to_string(second.join(".rift")).unwrap();
-        let first_trash = trash_path(first_id.trim(), &first).unwrap();
-        let second_trash = trash_path(second_id.trim(), &second).unwrap();
+        let first_id = marker_id(&first);
+        let second_id = marker_id(&second);
+        let first_trash = trash_path(&first_id, &first).unwrap();
+        let second_trash = trash_path(&second_id, &second).unwrap();
         manager.remove(&first).unwrap();
 
         let deleted = manager.gc().unwrap();
