@@ -1,4 +1,4 @@
-use super::Strategy;
+use super::{Strategy, StrategyInit};
 use crate::{Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
@@ -15,7 +15,7 @@ impl Strategy for BtrfsStrategy {
         &self,
         path: &Path,
         progress: &mut dyn FnMut(InitProgress),
-    ) -> Result<bool> {
+    ) -> Result<StrategyInit> {
         initialize_directory_linux(path, progress)
     }
 
@@ -38,7 +38,10 @@ fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_directory_linux(path: &Path, progress: &mut dyn FnMut(InitProgress)) -> Result<bool> {
+fn initialize_directory_linux(
+    path: &Path,
+    progress: &mut dyn FnMut(InitProgress),
+) -> Result<StrategyInit> {
     if !is_btrfs_filesystem(path)? {
         return Err(Error::CowUnavailable(format!(
             "{} is not on a btrfs filesystem",
@@ -46,7 +49,7 @@ fn initialize_directory_linux(path: &Path, progress: &mut dyn FnMut(InitProgress
         )));
     }
     if is_btrfs_subvolume(path)? {
-        return Ok(false);
+        return Ok(StrategyInit::AlreadyNative);
     }
 
     let parent = path
@@ -78,14 +81,14 @@ fn initialize_directory_linux(path: &Path, progress: &mut dyn FnMut(InitProgress
                 ))),
             };
         }
-        copy_metadata_linux(&original, path, false)?;
+        copy_metadata_linux(&original, path, MetadataTarget::FileOrDirectory)?;
         progress(InitProgress::RemovingOriginal);
         fs::remove_dir_all(&original).map_err(|error| {
             Error::CowUnavailable(format!(
                 "initialized workspace is active but failed to remove the original directory: {error}"
             ))
         })?;
-        Ok(true)
+        Ok(StrategyInit::Converted)
     })();
     if result.is_err() && staging.exists() {
         let _ = remove_directory_linux(&staging);
@@ -130,10 +133,10 @@ fn import_directory_linux(
             } else {
                 reflink_file_linux(source, &destination)?;
             }
-            copy_metadata_linux(source, &destination, false)?;
+            copy_metadata_linux(source, &destination, MetadataTarget::FileOrDirectory)?;
         } else if file_type.is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(source)?, &destination)?;
-            copy_metadata_linux(source, &destination, true)?;
+            copy_metadata_linux(source, &destination, MetadataTarget::Symlink)?;
         } else {
             return Err(Error::UnsupportedEntry(source.to_path_buf()));
         }
@@ -141,7 +144,7 @@ fn import_directory_linux(
         progress(InitProgress::ImportedEntries { entries });
     }
     for (source, destination) in directories.into_iter().rev() {
-        copy_metadata_linux(&source, &destination, false)?;
+        copy_metadata_linux(&source, &destination, MetadataTarget::FileOrDirectory)?;
     }
     Ok(())
 }
@@ -154,6 +157,8 @@ fn reflink_file_linux(from: &Path, to: &Path) -> Result<()> {
     const FICLONE: libc::c_ulong = 0x4004_9409;
     let source = File::open(from)?;
     let destination = OpenOptions::new().write(true).create_new(true).open(to)?;
+    // SAFETY: both file descriptors come from live `File` values, and FICLONE
+    // only reads the source fd while mutating the destination file.
     if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
         return Ok(());
     }
@@ -165,15 +170,24 @@ fn reflink_file_linux(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_metadata_linux(from: &Path, to: &Path, symlink: bool) -> Result<()> {
+#[derive(Clone, Copy)]
+enum MetadataTarget {
+    FileOrDirectory,
+    Symlink,
+}
+
+#[cfg(target_os = "linux")]
+fn copy_metadata_linux(from: &Path, to: &Path, target: MetadataTarget) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(from)?;
     let destination = c_path(to)?;
+    // SAFETY: `destination` is a valid null-terminated path, and uid/gid come
+    // from filesystem metadata for `from`.
     if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    if !symlink {
+    if matches!(target, MetadataTarget::FileOrDirectory) {
         fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
     }
     copy_xattrs_linux(from, to)?;
@@ -187,6 +201,8 @@ fn copy_metadata_linux(from: &Path, to: &Path, symlink: bool) -> Result<()> {
             tv_nsec: metadata.mtime_nsec(),
         },
     ];
+    // SAFETY: `destination` is a live C string and `times` contains exactly the
+    // two timestamps expected by `utimensat`.
     if unsafe {
         libc::utimensat(
             libc::AT_FDCWD,
@@ -205,11 +221,15 @@ fn copy_metadata_linux(from: &Path, to: &Path, symlink: bool) -> Result<()> {
 fn copy_xattrs_linux(from: &Path, to: &Path) -> Result<()> {
     let from = c_path(from)?;
     let to = c_path(to)?;
+    // SAFETY: `from` is a valid C path. A null buffer with size 0 asks the
+    // kernel for the required list size.
     let size = unsafe { libc::llistxattr(from.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let mut names = vec![0_u8; size as usize];
+    // SAFETY: `names` was allocated with the size reported by the previous
+    // `llistxattr` call, and its pointer is valid for writes of that length.
     if size > 0
         && unsafe { libc::llistxattr(from.as_ptr(), names.as_mut_ptr().cast(), names.len()) } < 0
     {
@@ -221,12 +241,16 @@ fn copy_xattrs_linux(from: &Path, to: &Path) -> Result<()> {
     {
         let name = std::ffi::CString::new(name)
             .map_err(|_| Error::Path("extended attribute name contains a null byte".into()))?;
+        // SAFETY: `from` and `name` are valid C strings. A null buffer with
+        // size 0 asks the kernel for this attribute's value length.
         let size =
             unsafe { libc::lgetxattr(from.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         if size < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         let mut value = vec![0_u8; size as usize];
+        // SAFETY: `value` was allocated with the exact size reported by
+        // `lgetxattr`, and the path and attribute name are valid C strings.
         if size > 0
             && unsafe {
                 libc::lgetxattr(
@@ -239,6 +263,8 @@ fn copy_xattrs_linux(from: &Path, to: &Path) -> Result<()> {
         {
             return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: `to` and `name` are valid C strings, and `value` points to
+        // an initialized byte buffer of the supplied length.
         if unsafe {
             libc::lsetxattr(
                 to.as_ptr(),
@@ -290,7 +316,11 @@ fn is_btrfs_filesystem(path: &Path) -> Result<bool> {
     const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683e;
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| Error::Path(format!("path contains a null byte: {}", path.display())))?;
+    // SAFETY: `statfs` is a plain C struct; zero initialization is a valid
+    // starting state before the kernel fills it.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid C string, and `stat` points to writable memory
+    // for the kernel to initialize.
     if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -393,6 +423,8 @@ fn btrfs_path_ioctl(
         *destination = *byte as libc::c_char;
     }
     let parent = File::open(parent)?;
+    // SAFETY: `parent` is an open directory fd, and `args` has the C layout
+    // expected by the btrfs volume ioctls for the duration of this call.
     let result = unsafe { libc::ioctl(parent.as_raw_fd(), request, &args) };
     if result == 0 {
         return Ok(());
@@ -435,6 +467,8 @@ mod linux_tests {
         let path = c_path(path).unwrap();
         let name = std::ffi::CString::new(name).unwrap();
         assert_eq!(
+            // SAFETY: test inputs are valid C strings and `value` is a live
+            // byte slice whose contents are copied by the kernel.
             unsafe {
                 libc::lsetxattr(
                     path.as_ptr(),
@@ -451,11 +485,15 @@ mod linux_tests {
     fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
         let path = c_path(path).unwrap();
         let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: test inputs are valid C strings. A null buffer with size 0
+        // requests the attribute value length.
         let size =
             unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
         assert!(size >= 0);
         let mut value = vec![0; size as usize];
         assert_eq!(
+            // SAFETY: `value` is allocated with the exact size returned by
+            // `lgetxattr`, and the C strings live for this call.
             unsafe {
                 libc::lgetxattr(
                     path.as_ptr(),
@@ -488,7 +526,10 @@ mod linux_tests {
         std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
         let mut progress = Vec::new();
 
-        assert!(initialize_directory_linux(&source, &mut |event| progress.push(event)).unwrap());
+        assert_eq!(
+            initialize_directory_linux(&source, &mut |event| progress.push(event)).unwrap(),
+            StrategyInit::Converted
+        );
         assert!(is_btrfs_subvolume(&source).unwrap());
         assert_eq!(
             fs::read_to_string(source.join("nested/file.txt")).unwrap(),
@@ -570,6 +611,8 @@ mod linux_tests {
         fs::create_dir(&to).unwrap();
         let fifo = from.join("fifo");
         let fifo_name = c_path(&fifo).unwrap();
+        // SAFETY: `fifo_name` is a valid C path and the mode is a normal
+        // permission bitmask for creating a FIFO in this test.
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         assert!(matches!(
             import_directory_linux(&from, &to, &mut |_| {}),

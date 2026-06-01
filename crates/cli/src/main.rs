@@ -96,22 +96,28 @@ fn error_message(error: &rift::Error) -> String {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::ShellInit { shell } = &cli.command {
-        print_shell_init(*shell);
-        return Ok(());
-    }
+    let command = match cli.command {
+        Command::ShellInit { shell } => {
+            print_shell_init(shell);
+            return Ok(());
+        }
+        command => command,
+    };
     let mut manager = match cli.database {
         Some(path) => Manager::open(path)?,
         None => Manager::open_default()?,
     };
-    match cli.command {
-        Command::ShellInit { .. } => unreachable!(),
+    match command {
+        Command::ShellInit { shell } => {
+            print_shell_init(shell);
+            Ok(())
+        }
         Command::Init { at, here } => {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
             let mut converting = false;
-            let converted = manager.init_with_progress(&at, |progress| match progress {
+            let outcome = manager.init_with_progress(&at, |progress| match progress {
                 InitProgress::CreatingSubvolume => {
                     converting = true;
                     eprintln!("Initializing  {}\n", at.display());
@@ -126,7 +132,7 @@ fn run() -> Result<()> {
                 | InitProgress::RestoringMarker
                 | InitProgress::RemovingOriginal => {}
             })?;
-            if converted {
+            if outcome.is_converted() {
                 if converting {
                     eprintln!("\nReady  {}", at.display());
                 } else {
@@ -149,6 +155,7 @@ fn run() -> Result<()> {
             } else {
                 eprintln!("Ready  {}", at.display());
             }
+            Ok(())
         }
         Command::Create { from, name, into } => {
             let destination = manager.create(Create {
@@ -160,6 +167,7 @@ fn run() -> Result<()> {
                 eprintln!("created {}", destination.display());
             }
             println!("{}", destination.display());
+            Ok(())
         }
         Command::Remove {
             at,
@@ -206,24 +214,27 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            Ok(())
         }
         Command::List { of } => {
             for path in manager.list(of.unwrap_or(std::env::current_dir()?))? {
                 println!("{}", path.display());
             }
+            Ok(())
         }
         Command::Ancestors { of } => {
             for path in manager.ancestors(of.unwrap_or(std::env::current_dir()?))? {
                 println!("{}", path.display());
             }
+            Ok(())
         }
         Command::Gc => {
             for path in manager.gc()? {
                 println!("{}", path.display());
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn init_target(
