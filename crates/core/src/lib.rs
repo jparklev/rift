@@ -92,7 +92,9 @@ impl Manager {
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
         let database = Connection::open(path)?;
         database.execute_batch(
-            "PRAGMA foreign_keys = ON;
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 2000;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS rift (
                id TEXT PRIMARY KEY,
                parent_id TEXT REFERENCES rift(id) ON DELETE CASCADE,
@@ -1397,6 +1399,24 @@ mod tests {
         ));
         assert!(source.join(".rift").exists());
         assert!(manager.list(&source).unwrap().is_empty());
+    }
+
+    // Smoke test: checks the PRAGMAs are set. Real concurrency test needed.
+    // TODO: test that two concurrent writes don't SQLITE_BUSY each other.
+    #[test]
+    fn database_uses_wal_and_busy_timeout() {
+        let temp = TempDir::new().unwrap();
+        let manager = manager(&temp);
+        let journal_mode: String = manager
+            .database
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        let busy_timeout: i32 = manager
+            .database
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 2000);
     }
 
     fn run(path: &Path, args: &[&str]) {
