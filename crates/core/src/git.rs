@@ -3,10 +3,22 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-pub(crate) fn check_source(path: &Path) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Source {
+    PlainDirectory,
+    Repository,
+}
+
+impl Source {
+    pub(crate) fn is_repository(self) -> bool {
+        matches!(self, Self::Repository)
+    }
+}
+
+pub(crate) fn check_source(path: &Path) -> Result<Source> {
     let git = path.join(".git");
     if !git.exists() {
-        return Ok(false);
+        return Ok(Source::PlainDirectory);
     }
     if !git.is_dir() {
         return Err(Error::UnsafeGit(
@@ -28,17 +40,17 @@ pub(crate) fn check_source(path: &Path) -> Result<bool> {
             return Err(Error::UnsafeGit(format!("Git state in progress: {state}")));
         }
     }
-    Ok(true)
+    Ok(Source::Repository)
 }
 
 pub(crate) fn hide_marker(path: &Path) -> Result<()> {
     let info = path.join(".git").join("info");
     fs::create_dir_all(&info)?;
     let exclude = info.join("exclude");
-    let existing = if exclude.exists() {
-        fs::read_to_string(&exclude)?
-    } else {
-        String::new()
+    let existing = match fs::read_to_string(&exclude) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
     };
     if existing.lines().any(|line| line.trim() == "/.rift") {
         return Ok(());
@@ -80,6 +92,16 @@ mod tests {
             check_source(temp.path()),
             Err(Error::UnsafeGit(_))
         ));
+    }
+
+    #[test]
+    fn check_source_distinguishes_plain_and_git_directories() {
+        let plain = TempDir::new().unwrap();
+        assert_eq!(check_source(plain.path()).unwrap(), Source::PlainDirectory);
+
+        let git = TempDir::new().unwrap();
+        fs::create_dir(git.path().join(".git")).unwrap();
+        assert_eq!(check_source(git.path()).unwrap(), Source::Repository);
     }
 
     #[test]
