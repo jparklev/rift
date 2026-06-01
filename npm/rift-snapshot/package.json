@@ -1,6 +1,6 @@
 {
   "name": "rift-snapshot",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Fast copy-on-write development workspaces",
   "license": "MIT",
   "repository": {
