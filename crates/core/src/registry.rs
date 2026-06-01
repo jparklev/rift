@@ -45,7 +45,9 @@ impl Registry {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         let database = Connection::open(path)?;
         database.execute_batch(
-            "PRAGMA foreign_keys = ON;
+            "PRAGMA busy_timeout = 2000;
+             PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS rift (
                id TEXT PRIMARY KEY,
                parent_id TEXT REFERENCES rift(id) ON DELETE CASCADE,
@@ -233,6 +235,22 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let registry = Registry::open(temp.path().join("registry.sqlite")).unwrap();
         (temp, registry)
+    }
+
+    #[test]
+    fn uses_wal_and_busy_timeout() {
+        let (_temp, registry) = registry();
+        let journal_mode: String = registry
+            .database
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i32 = registry
+            .database
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(busy_timeout, 2000);
     }
 
     #[test]
