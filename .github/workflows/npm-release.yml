@@ -102,6 +102,9 @@ jobs:
           pattern: npm-*
           path: npm-built
 
+      - name: Restore native executable permissions
+        run: chmod +x npm-built/npm-rift-snapshot-linux-x64/bin/rift npm-built/npm-rift-snapshot-darwin-x64/bin/rift npm-built/npm-rift-snapshot-darwin-arm64/bin/rift
+
       - name: Publish native packages
         shell: bash
         run: |

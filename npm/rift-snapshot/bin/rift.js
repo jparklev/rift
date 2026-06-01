@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import childProcess from "node:child_process"
+import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createRequire } from "node:module"
@@ -22,6 +23,15 @@ try {
 } catch {
   console.error(`Unable to locate ${name}. Reinstall rift-snapshot with optional dependencies enabled.`)
   process.exit(1)
+}
+
+if (platform !== "windows") {
+  try {
+    fs.chmodSync(binary, 0o755)
+  } catch (error) {
+    console.error(`Unable to make the Rift binary executable: ${error.message}`)
+    process.exit(1)
+  }
 }
 
 const result = childProcess.spawnSync(binary, process.argv.slice(2), {
