@@ -35,10 +35,10 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
     let info = path.join(".git").join("info");
     fs::create_dir_all(&info)?;
     let exclude = info.join("exclude");
-    let existing = if exclude.exists() {
-        fs::read_to_string(&exclude)?
-    } else {
-        String::new()
+    let existing = match fs::read_to_string(&exclude) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
     };
     if existing.lines().any(|line| line.trim() == "/.rift") {
         return Ok(());
