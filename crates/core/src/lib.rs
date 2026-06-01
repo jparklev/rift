@@ -92,8 +92,8 @@ impl Manager {
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
         let database = Connection::open(path)?;
         database.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 2000;
+            "PRAGMA busy_timeout = 2000;
+             PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS rift (
                id TEXT PRIMARY KEY,
