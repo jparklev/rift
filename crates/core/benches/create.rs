@@ -70,13 +70,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::open_default()?;
     manager.init(&source)?;
     let source = fs::canonicalize(source)?;
+    let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let process_id = std::process::id();
 
     let mut samples_ms = Vec::with_capacity(samples);
     for sample in 1..=samples {
         let started = Instant::now();
         let destination = manager.create(Create {
             from: source.clone(),
-            name: None,
+            name: Some(format!("benchmark-{process_id}-{run_id}-{sample}")),
             into: None,
         })?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
