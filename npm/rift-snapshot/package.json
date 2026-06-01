@@ -12,14 +12,18 @@
     "rift": "bin/rift.js"
   },
   "exports": {
-    "./bun": {
-      "types": "./bun/index.d.ts",
-      "default": "./bun/index.js"
+    ".": {
+      "types": "./index.d.ts",
+      "bun": "./bun/index.js",
+      "node": "./node/index.js",
+      "default": "./node/index.js"
     }
   },
   "files": [
     "bin",
     "bun",
+    "node",
+    "index.d.ts",
     "prebuilds"
   ],
   "os": [
