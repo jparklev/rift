@@ -601,7 +601,7 @@ mod tests {
         let source = temp.path().join("app");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("file.txt"), "hello").unwrap();
-        source
+        fs::canonicalize(source).unwrap()
     }
 
     #[test]
@@ -625,8 +625,9 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(first, temp.path().join(".rifts/app/first"));
-        assert_eq!(second, temp.path().join(".rifts/app/second"));
+        let parent = source.parent().unwrap();
+        assert_eq!(first, parent.join(".rifts/app/first"));
+        assert_eq!(second, parent.join(".rifts/app/second"));
         assert_ne!(
             fs::read_to_string(source.join(".rift")).unwrap(),
             fs::read_to_string(first.join(".rift")).unwrap()
@@ -675,7 +676,7 @@ mod tests {
                 into: Some(custom.clone()),
             })
             .unwrap();
-        assert_eq!(child, custom.join("custom"));
+        assert_eq!(child, fs::canonicalize(&custom).unwrap().join("custom"));
         assert!(matches!(
             manager.create(Create {
                 from: source.clone(),
@@ -1273,7 +1274,7 @@ mod tests {
         assert_eq!(manager.list(&source).unwrap(), vec![first]);
         assert_eq!(
             manager.ancestors(&second).unwrap(),
-            vec![temp.path().join(".rifts/app/first"), source]
+            vec![source.parent().unwrap().join(".rifts/app/first"), source]
         );
     }
 

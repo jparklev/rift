@@ -1,39 +1,8 @@
 # Rift
 
-<p align="center">
-  <strong>Instant workspaces for work that should not wait.</strong>
-</p>
+Rift creates copy-on-write copies of workspace directories and records their ancestry.
 
-<p align="center">
-  <a href="https://github.com/anomalyco/rift/actions/workflows/release.yml"><img alt="Release" src="https://img.shields.io/github/actions/workflow/status/anomalyco/rift/release.yml?label=release&style=flat-square"></a>
-  <a href="https://github.com/anomalyco/rift/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/anomalyco/rift?style=flat-square"></a>
-  <a href="https://www.npmjs.com/package/rift-snapshot"><img alt="npm" src="https://img.shields.io/npm/v/rift-snapshot?style=flat-square"></a>
-  <a href="./Cargo.toml"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-111?style=flat-square"></a>
-</p>
-
-Rift creates full, copy-on-write workspace forks in an instant. Not clean checkouts. Not partial Git state. The directory you have right now: staged files, dirty files, ignored files, build state, everything.
-
-Use it when you want another agent, another experiment, or another idea running in parallel without negotiating over one working tree.
-
-```bash
-npm i -g rift-snapshot # don't worry it's written in Rust
-
-cd ~/code/app
-eval "$(rift shell-init zsh)" # optional: make Rift navigate for you
-rift init                   # register this workspace once
-rift create                 # creates and enters the workspace
-```
-
-`rift-snapshot` is the temporary npm package name while `rift` is being acquired. The command is already `rift`.
-
-## Why Rift
-
-- Full workspace snapshots, including uncommitted and ignored state.
-- Copy-on-write creation instead of walking and recopying large trees.
-- Real lineage: create a rift from another rift and keep going.
-- Detached Git `HEAD` in new workspaces, without touching staged or dirty work.
-- Immediate removal from active use, with physical cleanup deferred to `rift gc`.
-- One npm package with a native CLI plus Bun and Node FFI bindings. No postinstall scripts.
+The command is `rift`. The npm package name is currently `rift-snapshot`.
 
 ## Install
 
@@ -43,157 +12,109 @@ npm install -g rift-snapshot
 bun add -g rift-snapshot
 ```
 
-Native archives are also published on [GitHub Releases](https://github.com/anomalyco/rift/releases/latest).
+Release archives are available from [GitHub Releases](https://github.com/anomalyco/rift/releases/latest).
 
-### Shell integration
+## Platforms
 
-Rift cannot change its parent shell as a standalone executable. Enable its small shell wrapper once per session, or from your shell config, to make workspace commands navigate automatically:
+| Platform          | Backend                  | Behavior |
+| ----------------- | ------------------------ | -------- |
+| Linux x64         | Writable btrfs snapshots | `rift init` converts an ordinary directory into a btrfs subvolume. |
+| macOS arm64 / x64 | APFS `clonefile`         | `rift init` registers the source directory. |
+| Windows x64       | None                     | The package is published; workspace creation is not implemented. |
+
+## CLI
+
+### Initialize
+
+```bash
+cd ~/code/app
+rift init
+```
+
+`rift init` selects an existing Rift root above the current directory, or the nearest Git root when no Rift root exists. Use `--here` to initialize exactly the selected directory.
+
+On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required conversion.
+
+### Create
+
+```bash
+rift create
+rift create --name parser-fix
+rift create --into /fast/rifts
+```
+
+`rift create` searches upward for `.rift`, copies that managed workspace, records the immediate parent, and prints the new workspace path to stdout.
+
+On Linux, it creates a writable btrfs snapshot. On macOS, it uses APFS `clonefile`.
+
+When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
+
+### List And Ancestors
+
+```bash
+rift list
+rift ancestors
+```
+
+`list` prints direct active child workspaces. `ancestors` prints parent workspaces, nearest first.
+
+### Remove And Garbage Collection
+
+```bash
+rift remove                         # trash the current created rift subtree
+rift remove -f ~/code/app           # unregister a source root
+rift remove --children ~/code/app   # trash descendants, preserve the selected workspace
+rift gc                             # physically delete trash and prune missing entries
+```
+
+Removing a created rift moves its active subtree into adjacent `.trash` storage. `rift gc` deletes that storage later.
+
+Removing a source root requires `-f` in the CLI. The source directory remains on disk. Its `.rift` marker is removed. Existing registered descendants are moved into trash. Missing descendants are removed from the registry.
+
+### Shell Integration
 
 ```bash
 eval "$(rift shell-init zsh)" # or bash
 ```
 
-With the wrapper enabled:
+The shell wrapper changes directory after `init` conversion, `create`, or removal of the current created rift.
 
-```bash
-rift init                      # enters the initialized subvolume after conversion
-rift create --name parser-fix  # enters the created rift
-rift remove                    # returns to its parent before removing the current rift
-```
+## Storage
 
-### Platforms
+Each managed workspace has a `.rift` marker containing its identifier. An SQLite registry stores paths, parent identifiers, and trash entries.
 
-| Platform          | Creation backend         | Status                                               |
-| ----------------- | ------------------------ | ---------------------------------------------------- |
-| Linux x64         | Writable btrfs snapshots | Supported; `rift init` also prepares the subvolume   |
-| macOS arm64 / x64 | APFS `clonefile`         | Supported                                            |
-| Windows x64       | Native package published | Copy-on-write backend not implemented yet            |
-
-Run `rift init` once to register a source workspace. On Linux, it also converts an ordinary btrfs directory into a subvolume with a clean swap at the same path; its native reflink importer reports when import is in progress because first time init can be slow, while creating new rifts will be instant. Run it from anywhere in a Git repository to initialize the nearest Git root; use `rift init --here` only when you intentionally want the current directory to be a separate Rift root.
-
-## CLI
-
-### Initialize a workspace
-
-On first-time Linux conversion, `rift init` reports the selected root and its progress:
+Default created-workspace storage is adjacent to the registered source root:
 
 ```text
-Initializing  ~/code/app
-
-First-time setup can take a moment.
-New rifts will be instant.
-
-Creating BTRFS subvolume...
-Importing workspace...
-
-Ready  ~/code/app
+~/code/app/                         source workspace
+~/code/.rifts/app/parser-fix/       created workspace
+~/code/.rifts/app/.trash/            removed workspace storage
 ```
-
-If the selected workspace is already registered, it prints one status line: `Already initialized  ~/code/app`.
-
-### Create a workspace
-
-```bash
-rift create                    # fork the current workspace
-rift create --name parser-fix  # choose a readable name
-rift create --into /fast/rifts # choose storage location
-```
-
-Rift prints the new workspace path, so this is convenient:
-
-```bash
-cd "$(rift create --name parser-fix)"
-```
-
-With shell integration enabled, simply run `rift create --name parser-fix` and Rift enters it.
-
-Workspace commands search upward for the nearest `.rift` marker, so they may be run from a subdirectory of an initialized workspace. If no marker is found, Rift asks you to run `rift init` in the root folder. If a registered workspace marker was deleted, running `rift init` restores it.
-
-If the source is a Git repository, the new workspace starts at a detached `HEAD` while preserving its exact index and working tree state.
-
-### Navigate the tree
-
-```bash
-rift list                      # direct active children of the current workspace
-rift ancestors                 # parent chain, nearest first
-```
-
-Creating from a rift records its immediate parent while storing workspaces side by side:
-
-```text
-~/code/app/                         original workspace
-~/code/.rifts/app/parser-fix/       child rift
-~/code/.rifts/app/alternate-route/  descendant or sibling rift
-```
-
-### Remove and clean up
-
-```bash
-rift remove                    # remove the current created rift
-rift remove -f ~/code/app      # unregister an initialized source root
-rift remove --children ~/code/app # remove descendants, preserve the root
-rift gc                        # physically delete removed workspaces and forget missing entries
-```
-
-`remove` is intentionally fast: it moves created rifts into adjacent `.trash/` storage and removes them from the active tree. In the CLI, unregistering an initialized source root requires `rift remove -f`; the source directory remains in place, its `.rift` marker is deleted, and existing registered descendants are moved into trash while missing descendants are forgotten. `gc` performs the potentially slow physical reclamation later and prunes registry entries for rifts deleted outside Rift when their full recorded subtree is gone. On standard btrfs mounts, reclamation may walk files when populated subvolume deletion is not permitted to the current user.
-
-Attempting to remove an initialized source root without confirmation prints:
-
-```text
-This is the root workspace.
-
-Unregistering it removes Rift metadata and trashes all child rifts.
-Run `rift remove -f` to continue.
-```
-
-After confirmation, Rift reports `Unregistered  ~/code/app`.
 
 ## JavaScript API
 
-The npm package exposes the same native implementation to Bun and Node through conditional exports:
-
-```js
-import { create, list, remove, gc } from "rift-snapshot";
-
-const workspace = create({ from: process.cwd(), name: "schema-work" });
-console.log(list({ of: process.cwd() }));
-
-remove({ at: workspace });
-gc();
-```
-
-### Bun
-
-```bash
-bun add rift-snapshot
-```
+The package selects a Bun or Node FFI binding through conditional exports.
 
 ```ts
-import { create } from "rift-snapshot";
+import { create, list, remove, gc } from "rift-snapshot"
 
-const workspace = create({ from: process.cwd() });
+const workspace = create({ from: process.cwd(), name: "schema-work" })
+console.log(list({ of: process.cwd() }))
+remove({ at: workspace })
+gc()
 ```
-
-The Bun binding uses `bun:ffi` and is statically analyzable for `bun build --compile`; required native libraries are embedded from the package prebuilds.
 
 ### Node.js
 
-Node bindings use the experimental `node:ffi` API available in Node.js 26.1+:
+The Node binding requires the experimental FFI API in Node.js 26.1 or later:
 
 ```bash
-npm install rift-snapshot
 node --experimental-ffi app.mjs
 ```
 
-```js
-import { create } from "rift-snapshot";
+With Node's permission model, also pass `--allow-ffi`.
 
-const workspace = create({ from: process.cwd() });
-```
-
-If using Node's permission model, also pass `--allow-ffi`.
-
-### API
+### Functions
 
 ```ts
 init(options?: { at?: string; database?: string }): null
@@ -205,22 +126,9 @@ ancestors(options?: { of?: string; database?: string }): string[]
 gc(options?: { database?: string }): string[]
 ```
 
-Path inputs default to the current working directory where applicable. Workspace operations locate their workspace by searching upward for `.rift`. The JavaScript `init` API initializes exactly `at`; the CLI provides Git-root selection and `--here` convenience behavior. `database` is useful for isolated tooling and tests; normal use relies on Rift's user-local registry.
+The JavaScript `init` function initializes exactly `at`; Git-root selection and `--here` are CLI behavior.
 
-Operation failures throw `RiftError`, which provides a stable `code` and, for path-specific failures, `path`. For example, `workspace_not_initialized` indicates that the caller should initialize the intended workspace root. Human-oriented recovery instructions are rendered by the CLI rather than embedded in library errors.
-
-## Design Notes
-
-Rift stores stable identities in `.rift` marker files and ancestry in a local SQLite registry. Active workspace storage lives outside the source being snapshotted, normally in a hidden sibling directory:
-
-```text
-~/code/app/
-~/code/.rifts/app/
-```
-
-Rift does not create branches, commit changes, or replace Git. It gives your current filesystem state somewhere new to run.
-
-Filesystem behavior is implemented through strategies: Linux uses a btrfs subvolume strategy, while macOS uses an APFS `clonefile` strategy.
+Operation failures throw `RiftError` with a `code` and, when relevant, `path`.
 
 ## Development
 
@@ -229,7 +137,7 @@ cargo test --workspace --locked
 ./scripts/install.sh
 ```
 
-The install script builds the optimized CLI and installs it to `${CARGO_HOME:-$HOME/.cargo}/bin/rift`.
+`scripts/install.sh` installs an optimized CLI binary to `${CARGO_HOME:-$HOME/.cargo}/bin/rift`.
 
 ## License
 
