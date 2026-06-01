@@ -143,11 +143,11 @@ impl Manager {
 
         let result = (|| {
             write_marker(&destination, &id)?;
-            if git {
+            if git.is_repository() {
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
             }
-            if git {
+            if git.is_repository() {
                 git::hide_marker(&from)?;
             }
             self.database.execute(
@@ -181,7 +181,7 @@ impl Manager {
                 verify_marker(&record)?;
             }
             let converted = self.strategy.initialize_directory(&at, &mut progress)?;
-            if git {
+            if git.is_repository() {
                 git::hide_marker(&at)?;
             }
             return Ok(converted);
@@ -195,7 +195,7 @@ impl Manager {
         let id = Ulid::new().to_string();
         let result = (|| {
             write_marker(&at, &id)?;
-            if git {
+            if git.is_repository() {
                 git::hide_marker(&at)?;
             }
             self.database.execute(
