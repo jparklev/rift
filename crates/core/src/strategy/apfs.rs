@@ -13,6 +13,8 @@ impl Strategy for ApfsStrategy {
             .map_err(|_| Error::Path(format!("path contains a null byte: {}", from.display())))?;
         let destination = CString::new(to.as_os_str().as_bytes())
             .map_err(|_| Error::Path(format!("path contains a null byte: {}", to.display())))?;
+        // SAFETY: `source` and `destination` are null-terminated C strings
+        // built above, and both live for the duration of the call.
         let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) };
         if result == 0 {
             return Ok(());
