@@ -100,11 +100,10 @@ impl From<Error> for Failure {
 fn execute(input: &str) -> Result<Value, Failure> {
     let request: Request = serde_json::from_str(input)
         .map_err(|error| Failure::protocol("invalid_request", error.to_string()))?;
-    let mut manager = match request.database {
-        Some(path) => Manager::open(path),
-        None => Manager::open_default(),
-    }
-    .map_err(Failure::from)?;
+    let mut manager = request
+        .database
+        .map_or_else(Manager::open_default, Manager::open)
+        .map_err(Failure::from)?;
     match request.command {
         Command::Init { at } => manager
             .init(at)

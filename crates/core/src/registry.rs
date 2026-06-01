@@ -144,7 +144,7 @@ impl Registry {
 
     pub(crate) fn trash_moved(&mut self, moved: &[MovedRecord]) -> Result<()> {
         let transaction = self.database.transaction()?;
-        for record in moved {
+        moved.iter().try_for_each(|record| -> Result<()> {
             transaction.execute(
                 "INSERT INTO trash (id, path, removed_at) VALUES (?1, ?2, ?3)",
                 params![
@@ -154,7 +154,8 @@ impl Registry {
                 ],
             )?;
             transaction.execute("DELETE FROM rift WHERE id = ?1", [record.id.as_str()])?;
-        }
+            Ok(())
+        })?;
         transaction.commit()?;
         Ok(())
     }
@@ -193,9 +194,10 @@ impl Registry {
 
     pub(crate) fn delete_active_records(&mut self, rows: &[PathRecord]) -> Result<()> {
         let transaction = self.database.transaction()?;
-        for record in rows {
+        rows.iter().try_for_each(|record| -> Result<()> {
             transaction.execute("DELETE FROM rift WHERE id = ?1", [record.id.as_str()])?;
-        }
+            Ok(())
+        })?;
         transaction.commit()?;
         Ok(())
     }

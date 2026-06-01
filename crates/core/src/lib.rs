@@ -244,12 +244,14 @@ impl Manager {
     }
 
     fn trash_rows(&mut self, rows: &[PathRecord]) -> Result<()> {
-        for row in rows {
-            if !row.path.exists() {
-                return Err(Error::MissingRift(row.path.clone()));
-            }
+        rows.iter().try_for_each(|row| -> Result<()> {
+            row.path
+                .exists()
+                .then_some(())
+                .ok_or_else(|| Error::MissingRift(row.path.clone()))?;
             marker::verify(&row.path, &row.id)?;
-        }
+            Ok(())
+        })?;
         let targets = rows
             .iter()
             .map(|row| {
@@ -260,11 +262,11 @@ impl Manager {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        for target in &targets {
-            if target.trash_path.exists() {
-                return Err(Error::AlreadyExists(target.trash_path.clone()));
-            }
-        }
+        targets.iter().try_for_each(|target| {
+            (!target.trash_path.exists())
+                .then_some(())
+                .ok_or_else(|| Error::AlreadyExists(target.trash_path.clone()))
+        })?;
         let mut moved: Vec<MovedRecord> = Vec::with_capacity(rows.len());
         for target in targets {
             let trash_parent = target.trash_path.parent().ok_or_else(|| {
@@ -312,33 +314,41 @@ impl Manager {
     }
 
     pub fn gc(&mut self) -> Result<Vec<PathBuf>> {
-        let mut removed = Vec::new();
-        for row in self.registry.trashed_paths()? {
-            if row.path.exists() {
-                self.strategy.remove_directory(&row.path)?;
-            }
-            self.registry.delete_trash(&row.id)?;
-            removed.push(row.path);
-        }
+        let removed = self
+            .registry
+            .trashed_paths()?
+            .into_iter()
+            .map(|row| -> Result<PathBuf> {
+                if row.path.exists() {
+                    self.strategy.remove_directory(&row.path)?;
+                }
+                self.registry.delete_trash(&row.id)?;
+                Ok(row.path)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let mut missing = Vec::new();
-        for row in self.registry.active_paths()? {
-            if row.path.exists() {
-                continue;
-            }
-            if self
-                .registry
-                .subtree(&row.id, SubtreeScope::DescendantsOnly)?
-                .iter()
-                .any(|descendant| descendant.path.exists())
-            {
-                continue;
-            }
-            missing.push(row);
-        }
+        let missing = self
+            .registry
+            .active_paths()?
+            .into_iter()
+            .filter(|row| !row.path.exists())
+            .map(|row| {
+                self.registry
+                    .subtree(&row.id, SubtreeScope::DescendantsOnly)
+                    .map(|descendants| {
+                        (!descendants
+                            .iter()
+                            .any(|descendant| descendant.path.exists()))
+                        .then_some(row)
+                    })
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>>>()?;
         self.registry.delete_active_records(&missing)?;
-        removed.extend(missing.into_iter().map(|record| record.path));
-        Ok(removed)
+        Ok(removed
+            .into_iter()
+            .chain(missing.into_iter().map(|record| record.path))
+            .collect())
     }
 
     pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
