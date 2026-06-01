@@ -1,0 +1,123 @@
+use rift::{Create, Manager};
+use serde::Serialize;
+use std::env;
+use std::error::Error;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Serialize)]
+struct BenchmarkResult {
+    benchmark: &'static str,
+    timestamp_ms: u128,
+    platform: &'static str,
+    source: PathBuf,
+    samples_ms: Vec<f64>,
+    median_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    cleanup_passed: bool,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("benchmark failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let mut arguments = env::args_os()
+        .skip(1)
+        .filter(|argument| argument.as_os_str() != OsStr::new("--bench"));
+    let mut source = None;
+    let mut output = None;
+    let mut samples = 1;
+    while let Some(argument) = arguments.next() {
+        if argument == OsStr::new("--output") {
+            if output.is_some() {
+                return Err("the create benchmark accepts only one --output path".into());
+            }
+            output = Some(
+                arguments
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or("--output requires a file path")?,
+            );
+            continue;
+        }
+        if argument == OsStr::new("--samples") {
+            let value = arguments.next().ok_or("--samples requires a count")?;
+            samples = value
+                .to_str()
+                .ok_or("--samples requires a UTF-8 integer")?
+                .parse::<usize>()?;
+            if samples == 0 {
+                return Err("--samples must be greater than zero".into());
+            }
+            continue;
+        }
+        if source.is_some() {
+            return Err("the create benchmark accepts exactly one workspace directory".into());
+        }
+        source = Some(PathBuf::from(argument));
+    }
+    let source = source.ok_or(
+        "usage: cargo bench --bench create -- /path/to/workspace [--samples N] [--output /path/to/result.json]",
+    )?;
+
+    let mut manager = Manager::open_default()?;
+    manager.init(&source)?;
+    let source = fs::canonicalize(source)?;
+
+    let mut samples_ms = Vec::with_capacity(samples);
+    for sample in 1..=samples {
+        let started = Instant::now();
+        let destination = manager.create(Create {
+            from: source.clone(),
+            name: None,
+            into: None,
+        })?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        println!(
+            "create\t{sample}/{samples}\t{elapsed_ms:.3} ms\t{}",
+            destination.display()
+        );
+
+        manager.remove(&destination)?;
+        manager.gc()?;
+        samples_ms.push(elapsed_ms);
+    }
+
+    let mut sorted = samples_ms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median_ms = if samples % 2 == 0 {
+        (sorted[samples / 2 - 1] + sorted[samples / 2]) / 2.0
+    } else {
+        sorted[samples / 2]
+    };
+    let min_ms = sorted[0];
+    let max_ms = sorted[samples - 1];
+
+    if samples > 1 {
+        println!("median\t{median_ms:.3} ms\tmin {min_ms:.3} ms\tmax {max_ms:.3} ms");
+    }
+
+    if let Some(output) = output {
+        let result = BenchmarkResult {
+            benchmark: "create",
+            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            platform: env::consts::OS,
+            source,
+            samples_ms,
+            median_ms,
+            min_ms,
+            max_ms,
+            cleanup_passed: true,
+        };
+        fs::write(output, serde_json::to_string_pretty(&result)? + "\n")?;
+    }
+    Ok(())
+}

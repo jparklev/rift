@@ -508,6 +508,8 @@ dependencies = [
  "libc",
  "rand",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "ulid",
