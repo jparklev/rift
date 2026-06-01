@@ -11,16 +11,19 @@
 ```ts
 init(input: {
   at: AbsolutePath
-}): AbsolutePath | undefined
+}): void
 ```
 
 `init` prepares and registers an original workspace for Rift.
 
-- On Linux, `at` must be on btrfs.
+- On Linux, `at` must be on btrfs; on other supported systems, initialization registers the workspace without filesystem conversion.
 - If `at` is already a btrfs subvolume, register it without replacing it.
-- If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume, swap the new subvolume into its original path, and return the retained backup path.
-- The retained backup is not registered as a workspace and remains for explicit user cleanup.
-- The CLI defaults `at` to the current working directory and may be run from within that workspace; after a conversion it tells the caller to re-enter the original path.
+- If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume and atomically replace the original directory at its existing path.
+- The original directory is retained under an internal temporary path only while it is needed for rollback and is removed before a successful `init` returns.
+- The core operation initializes exactly `at` and does not search parent directories.
+- The CLI defaults `at` to the current working directory; by default it selects the nearest existing managed ancestor or nearest Git root, prints the selected path, and then invokes core `init` with that exact path. `--here` opts into selecting exactly the supplied path.
+- Calling `init` inside an already initialized workspace reports the existing root; if that root's `.rift` marker was deleted, `init` restores the marker using its existing registry identity.
+- After a conversion it tells the caller to re-enter the original path.
 
 ### `create`
 
@@ -54,7 +57,8 @@ Default storage is a hidden sibling directory of the original registered workspa
 ```
 
 - Created rifts must not be stored inside the workspace being copied, because an exact copy would recursively contain existing rifts.
-- If `from` is an original unregistered workspace, its sibling `.rifts/<workspace-name>/` directory becomes the default destination directory.
+- `from` resolves upward to the nearest `.rift` marker and must belong to an initialized workspace; if no marker is found, instruct the user to run `rift init` in the root folder.
+- The original registered workspace's sibling `.rifts/<workspace-name>/` directory becomes the default destination directory.
 - If `from` is already managed, descendants use the default destination directory associated with the original workspace rather than nesting storage beside each descendant.
 - If `into` is provided, use it instead of the default destination directory.
 - If the original workspace is itself a filesystem mount root, its sibling default destination may not support copy-on-write with it; provide `into` on the same filesystem in that case.
@@ -68,9 +72,10 @@ remove(input: {
 }): void
 ```
 
-`remove` logically deletes a managed rift and its full descendant subtree immediately by moving them into Rift-owned trash.
+`remove` logically deletes a created rift subtree by moving it into Rift-owned trash, or unregisters a registered source root while preserving its directory.
 
-- `at` must identify a rift created by this tool; the registered source root cannot be removed.
+- If `at` identifies a registered source root, preserve its directory, delete its `.rift` marker, move each existing registered descendant into trash, tolerate descendants already absent from disk, and delete its active registry tree.
+- If `at` identifies a created rift, move its full descendant subtree into trash.
 - When `all` is true, preserve `at` and delete every managed descendant. In this mode `at` may be the registered source root.
 - Resolve all descendants through `parent_id` and move their directories deepest-first.
 - Verify each existing directory's `.rift` marker before deleting it.
@@ -109,6 +114,7 @@ gc(): AbsolutePath[]
 - On Linux, attempt immediate btrfs subvolume deletion first.
 - If standard mount permissions deny deletion of a populated subvolume, delete its contents and remove the now-empty subvolume with ordinary directory removal.
 - Delete each trash registry record after its filesystem directory is successfully removed.
+- Delete active registry records whose filesystem directories were removed outside Rift only when no existing recorded descendant would be orphaned, and include pruned missing paths in the result.
 
 ## Metadata
 
@@ -168,11 +174,11 @@ The tool does not create branches, commit changes, or otherwise replace normal G
 
 ## Copy Strategies
 
-Copying is implemented behind a strategy boundary so platform-specific copy-on-write backends can be added independently.
+Copying is implemented behind a `Strategy` interface so platform-specific copy-on-write backends can be added independently. Each strategy owns initialization, snapshot creation, and removal behavior for its filesystem.
 
-- The production strategy on Linux uses writable btrfs subvolume snapshots.
-- Linux `init` performs a single reflink import only when converting an existing ordinary btrfs workspace into a subvolume; `create` never performs file-by-file cloning.
-- The production strategy on macOS uses APFS `clonefile` directory cloning.
+- The `BtrfsStrategy` production strategy on Linux uses writable btrfs subvolume snapshots.
+- Linux `init` performs a native per-file reflink import only when converting an existing ordinary btrfs workspace into a subvolume; it does not spawn an external copy command and may report import progress. `create` never performs file-by-file cloning.
+- The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning.
 - If no implemented copy-on-write strategy succeeds, `create` fails.
 - Full byte copying is not implemented as a fallback.
 - Future strategies may add Windows copy-on-write support without changing the API.
@@ -190,6 +196,6 @@ The CLI and language bindings should remain thin and expose the same API semanti
 
 The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
 
-For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted.
+For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted. Workspace operations locate their root by searching upward for its `.rift` marker. The CLI applies similar selection before calling exact-path core `init`, unless `rift init --here` is explicitly requested.
 
 The CLI may provide opt-in Bash/Zsh integration through `eval "$(rift shell-init <shell>)"`. The resulting shell function delegates filesystem and registry operations to the executable, then changes the caller's working directory after `init`, `create`, or removal of the current rift. This shell behavior is not part of the native library or FFI APIs.

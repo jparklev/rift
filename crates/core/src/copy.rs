@@ -1,16 +1,18 @@
-use crate::{Error, Result};
+use crate::{Error, InitProgress, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::process::Command;
-#[cfg(test)]
+use std::path::Path;
+#[cfg(any(test, target_os = "linux"))]
 use walkdir::WalkDir;
 
-pub(crate) trait CopyStrategy {
+pub(crate) trait Strategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()>;
 
-    fn initialize_directory(&self, _path: &Path) -> Result<Option<PathBuf>> {
-        Ok(None)
+    fn initialize_directory(
+        &self,
+        _path: &Path,
+        _progress: &mut dyn FnMut(InitProgress),
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     fn remove_directory(&self, path: &Path) -> Result<()> {
@@ -19,47 +21,58 @@ pub(crate) trait CopyStrategy {
     }
 }
 
-pub(crate) struct CowStrategy;
+pub(crate) fn default_strategy() -> Box<dyn Strategy> {
+    #[cfg(target_os = "linux")]
+    return Box::new(BtrfsStrategy);
 
-impl CopyStrategy for CowStrategy {
+    #[cfg(target_os = "macos")]
+    return Box::new(ApfsStrategy);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Box::new(UnsupportedStrategy);
+}
+
+#[cfg(target_os = "linux")]
+struct BtrfsStrategy;
+
+#[cfg(target_os = "linux")]
+impl Strategy for BtrfsStrategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        return copy_directory_linux(from, to);
-
-        #[cfg(target_os = "macos")]
-        return copy_directory_macos(from, to);
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = (from, to);
-            Err(Error::CowUnavailable(
-                "no copy-on-write strategy has been implemented for this platform".into(),
-            ))
-        }
+        copy_directory_linux(from, to)
     }
 
-    fn initialize_directory(&self, path: &Path) -> Result<Option<PathBuf>> {
-        #[cfg(target_os = "linux")]
-        return initialize_directory_linux(path);
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = path;
-            Err(Error::CowUnavailable(
-                "rift init is currently implemented only for btrfs on Linux".into(),
-            ))
-        }
+    fn initialize_directory(
+        &self,
+        path: &Path,
+        progress: &mut dyn FnMut(InitProgress),
+    ) -> Result<bool> {
+        initialize_directory_linux(path, progress)
     }
 
     fn remove_directory(&self, path: &Path) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        return remove_directory_linux(path);
+        remove_directory_linux(path)
+    }
+}
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            fs::remove_dir_all(path)?;
-            Ok(())
-        }
+#[cfg(target_os = "macos")]
+struct ApfsStrategy;
+
+#[cfg(target_os = "macos")]
+impl Strategy for ApfsStrategy {
+    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
+        copy_directory_macos(from, to)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct UnsupportedStrategy;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Strategy for UnsupportedStrategy {
+    fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
+        Err(Error::CowUnavailable(
+            "no copy-on-write strategy has been implemented for this platform".into(),
+        ))
     }
 }
 
@@ -98,7 +111,7 @@ fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_directory_linux(path: &Path) -> Result<Option<PathBuf>> {
+fn initialize_directory_linux(path: &Path, progress: &mut dyn FnMut(InitProgress)) -> Result<bool> {
     if !is_btrfs_filesystem(path)? {
         return Err(Error::CowUnavailable(format!(
             "{} is not on a btrfs filesystem",
@@ -106,51 +119,207 @@ fn initialize_directory_linux(path: &Path) -> Result<Option<PathBuf>> {
         )));
     }
     if is_btrfs_subvolume(path)? {
-        return Ok(None);
+        return Ok(false);
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| Error::Path(format!("workspace has no parent: {}", path.display())))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| Error::Path(format!("workspace has no name: {}", path.display())))?;
-    let mut backup_name = file_name.to_os_string();
-    backup_name.push(".rift-backup");
-    let backup = parent.join(backup_name);
-    if backup.exists() {
-        return Err(Error::AlreadyExists(backup));
-    }
-    let staging = parent.join(format!(".rift-init-{}", ulid::Ulid::new()));
+    let operation_id = ulid::Ulid::new();
+    let staging = parent.join(format!(".rift-init-{operation_id}"));
+    let original = parent.join(format!(".rift-init-original-{operation_id}"));
 
+    progress(InitProgress::CreatingSubvolume);
     create_btrfs_subvolume(&staging)?;
 
     let result = (|| {
-        let source_contents = path.join(".");
-        let output = Command::new("cp")
-            .args(["-a", "--reflink=always", "--"])
-            .arg(source_contents)
-            .arg(&staging)
-            .output()?;
-        if !output.status.success() {
-            return Err(Error::CowUnavailable(format!(
-                "failed to import {} into a btrfs subvolume: {}",
-                path.display(),
-                command_error(&output)
-            )));
-        }
-        fs::set_permissions(&staging, fs::metadata(path)?.permissions())?;
-        fs::rename(path, &backup)?;
+        progress(InitProgress::ImportingWorkspace);
+        import_directory_linux(path, &staging, progress)?;
+        progress(InitProgress::ActivatingWorkspace);
+        fs::rename(path, &original)?;
         if let Err(error) = fs::rename(&staging, path) {
-            let _ = fs::rename(&backup, path);
+            let _ = fs::rename(&original, path);
             return Err(error.into());
         }
-        Ok(Some(backup.clone()))
+        progress(InitProgress::RemovingOriginal);
+        fs::remove_dir_all(&original)?;
+        Ok(true)
     })();
     if result.is_err() && staging.exists() {
         let _ = remove_directory_linux(&staging);
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn import_directory_linux(
+    from: &Path,
+    to: &Path,
+    progress: &mut dyn FnMut(InitProgress),
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut hard_links = HashMap::new();
+    let mut directories = Vec::new();
+    let mut entries = 0;
+    for entry in WalkDir::new(from).min_depth(1).follow_links(false) {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = to.join(
+            source
+                .strip_prefix(from)
+                .map_err(|error| Error::Path(error.to_string()))?,
+        );
+        let metadata = fs::symlink_metadata(source)?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            fs::create_dir(&destination)?;
+            directories.push((source.to_path_buf(), destination));
+        } else if file_type.is_file() {
+            let key = (metadata.dev(), metadata.ino());
+            if metadata.nlink() > 1 {
+                if let Some(existing) = hard_links.get(&key) {
+                    fs::hard_link(existing, &destination)?;
+                } else {
+                    reflink_file_linux(source, &destination)?;
+                    hard_links.insert(key, destination.clone());
+                }
+            } else {
+                reflink_file_linux(source, &destination)?;
+            }
+            copy_metadata_linux(source, &destination, false)?;
+        } else if file_type.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(source)?, &destination)?;
+            copy_metadata_linux(source, &destination, true)?;
+        } else {
+            return Err(Error::UnsupportedEntry(source.to_path_buf()));
+        }
+        entries += 1;
+        progress(InitProgress::ImportedEntries { entries });
+    }
+    for (source, destination) in directories.into_iter().rev() {
+        copy_metadata_linux(&source, &destination, false)?;
+    }
+    copy_metadata_linux(from, to, false)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reflink_file_linux(from: &Path, to: &Path) -> Result<()> {
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
+
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let source = File::open(from)?;
+    let destination = OpenOptions::new().write(true).create_new(true).open(to)?;
+    if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    Err(Error::CowUnavailable(format!(
+        "failed to reflink {}: {}",
+        from.display(),
+        std::io::Error::last_os_error()
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn copy_metadata_linux(from: &Path, to: &Path, symlink: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(from)?;
+    let destination = c_path(to)?;
+    if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if !symlink {
+        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
+    }
+    copy_xattrs_linux(from, to)?;
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime(),
+            tv_nsec: metadata.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime(),
+            tv_nsec: metadata.mtime_nsec(),
+        },
+    ];
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_xattrs_linux(from: &Path, to: &Path) -> Result<()> {
+    let from = c_path(from)?;
+    let to = c_path(to)?;
+    let size = unsafe { libc::llistxattr(from.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut names = vec![0_u8; size as usize];
+    if size > 0
+        && unsafe { libc::llistxattr(from.as_ptr(), names.as_mut_ptr().cast(), names.len()) } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| Error::Path("extended attribute name contains a null byte".into()))?;
+        let size =
+            unsafe { libc::lgetxattr(from.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut value = vec![0_u8; size as usize];
+        if size > 0
+            && unsafe {
+                libc::lgetxattr(
+                    from.as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe {
+            libc::lsetxattr(
+                to.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn c_path(path: &Path) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Path(format!("path contains a null byte: {}", path.display())))
 }
 
 #[cfg(target_os = "linux")]
@@ -297,11 +466,6 @@ fn btrfs_path_ioctl(
     )))
 }
 
-#[cfg(target_os = "linux")]
-fn command_error(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).trim().to_owned()
-}
-
 #[cfg(all(test, unix))]
 fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
     std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
@@ -323,7 +487,7 @@ fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
 pub(crate) struct TestStrategy;
 
 #[cfg(test)]
-impl CopyStrategy for TestStrategy {
+impl Strategy for TestStrategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
         fs::create_dir(to)?;
         for entry in WalkDir::new(from).min_depth(1).follow_links(false) {
@@ -352,7 +516,7 @@ impl CopyStrategy for TestStrategy {
 pub(crate) struct FailureStrategy;
 
 #[cfg(test)]
-impl CopyStrategy for FailureStrategy {
+impl Strategy for FailureStrategy {
     fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
         Err(Error::CowUnavailable("test failure".into()))
     }

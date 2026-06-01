@@ -20,7 +20,34 @@ export interface OfOptions extends Options {
   of?: string
 }
 
-export function init(options?: AtOptions): string | null
+export type RiftErrorCode =
+  | "io"
+  | "database"
+  | "walk"
+  | "invalid_path"
+  | "cow_unavailable"
+  | "initialization_required"
+  | "workspace_not_initialized"
+  | "missing_marker"
+  | "unsupported_entry"
+  | "unsafe_git"
+  | "not_managed"
+  | "marker_mismatch"
+  | "unknown_marker"
+  | "already_exists"
+  | "missing_rift"
+  | "inside_source"
+  | "invalid_request"
+  | "panic"
+  | "serialization"
+
+export class RiftError extends Error {
+  code: RiftErrorCode
+  path?: string
+  constructor(input: { code: RiftErrorCode; message: string; path?: string })
+}
+
+export function init(options?: AtOptions): null
 export function create(options?: CreateOptions): string
 export function remove(options?: RemoveOptions & { all: true }): string[]
 export function remove(options?: RemoveOptions): void

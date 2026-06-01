@@ -27,8 +27,17 @@ function call(request) {
   } finally {
     functions.rift_ffi_free(output)
   }
-  if (response.status === "error") throw new Error(response.error)
+  if (response.status === "error") throw new RiftError(response.error)
   return response.value
+}
+
+export class RiftError extends Error {
+  constructor({ code, message, path }) {
+    super(message)
+    this.name = "RiftError"
+    this.code = code
+    this.path = path
+  }
 }
 
 export function init({ at = process.cwd(), database } = {}) {

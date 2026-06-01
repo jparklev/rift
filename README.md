@@ -20,7 +20,7 @@ npm i -g rift-snapshot # don't worry it's written in Rust
 
 cd ~/code/app
 eval "$(rift shell-init zsh)" # optional: make Rift navigate for you
-rift init                   # once on Linux/btrfs
+rift init                   # register this workspace once
 rift create                 # creates and enters the workspace
 ```
 
@@ -65,11 +65,11 @@ rift remove                    # returns to its parent before removing the curre
 
 | Platform          | Creation backend         | Status                                               |
 | ----------------- | ------------------------ | ---------------------------------------------------- |
-| Linux x64         | Writable btrfs snapshots | Supported; run `rift init` once per source workspace |
+| Linux x64         | Writable btrfs snapshots | Supported; `rift init` also prepares the subvolume   |
 | macOS arm64 / x64 | APFS `clonefile`         | Supported                                            |
 | Windows x64       | Native package published | Copy-on-write backend not implemented yet            |
 
-On Linux, `rift init` converts an ordinary btrfs directory into a subvolume once and retains the original as `<name>.rift-backup`. After that, `rift create` uses native btrfs snapshots.
+Run `rift init` once to register a source workspace. On Linux, it also converts an ordinary btrfs directory into a subvolume with a clean swap at the same path; its native reflink importer reports entry progress because first time init can be slow, while creating new rifts will be instant. Run it from anywhere in a Git repository to initialize the nearest Git root; use `rift init --here` only when you intentionally want the current directory to be a separate Rift root.
 
 ## CLI
 
@@ -88,6 +88,8 @@ cd "$(rift create --name parser-fix)"
 ```
 
 With shell integration enabled, simply run `rift create --name parser-fix` and Rift enters it.
+
+Workspace commands search upward for the nearest `.rift` marker, so they may be run from a subdirectory of an initialized workspace. If no marker is found, Rift asks you to run `rift init` in the root folder. If a registered workspace marker was deleted, running `rift init` restores it.
 
 If the source is a Git repository, the new workspace starts at a detached `HEAD` while preserving its exact index and working tree state.
 
@@ -109,12 +111,12 @@ Creating from a rift records its immediate parent while storing workspaces side 
 ### Remove and clean up
 
 ```bash
-rift remove                    # remove the current rift subtree from active use
+rift remove                    # remove a rift, or unregister an initialized source root
 rift remove --all ~/code/app   # remove all descendants, preserve the root
-rift gc                        # physically delete removed workspaces
+rift gc                        # physically delete removed workspaces and forget missing entries
 ```
 
-`remove` is intentionally fast: it moves rifts into adjacent `.trash/` storage and removes them from the active tree. `gc` reclaims the filesystem storage later. On standard btrfs mounts, reclamation may walk files when populated subvolume deletion is not permitted to the current user.
+`remove` is intentionally fast: it moves created rifts into adjacent `.trash/` storage and removes them from the active tree. When applied to an initialized source root, it unregisters the source: the source directory remains in place, its `.rift` marker is deleted, and existing registered descendants are moved into trash while missing descendants are forgotten. `gc` performs the potentially slow physical reclamation later and prunes registry entries for rifts deleted outside Rift when their full recorded subtree is gone. On standard btrfs mounts, reclamation may walk files when populated subvolume deletion is not permitted to the current user.
 
 ## JavaScript API
 
@@ -164,7 +166,7 @@ If using Node's permission model, also pass `--allow-ffi`.
 ### API
 
 ```ts
-init(options?: { at?: string; database?: string }): string | null
+init(options?: { at?: string; database?: string }): null
 create(options?: { from?: string; name?: string; into?: string; database?: string }): string
 remove(options?: { at?: string; all?: false; database?: string }): void
 remove(options: { at?: string; all: true; database?: string }): string[]
@@ -173,7 +175,9 @@ ancestors(options?: { of?: string; database?: string }): string[]
 gc(options?: { database?: string }): string[]
 ```
 
-Path inputs default to the current working directory where applicable. `database` is useful for isolated tooling and tests; normal use relies on Rift's user-local registry.
+Path inputs default to the current working directory where applicable. Workspace operations locate their workspace by searching upward for `.rift`. The JavaScript `init` API initializes exactly `at`; the CLI provides Git-root selection and `--here` convenience behavior. `database` is useful for isolated tooling and tests; normal use relies on Rift's user-local registry.
+
+Operation failures throw `RiftError`, which provides a stable `code` and, for path-specific failures, `path`. For example, `workspace_not_initialized` indicates that the caller should initialize the intended workspace root. Human-oriented recovery instructions are rendered by the CLI rather than embedded in library errors.
 
 ## Design Notes
 
@@ -186,14 +190,16 @@ Rift stores stable identities in `.rift` marker files and ancestry in a local SQ
 
 Rift does not create branches, commit changes, or replace Git. It gives your current filesystem state somewhere new to run.
 
+Filesystem behavior is implemented through strategies: Linux uses a btrfs subvolume strategy, while macOS uses an APFS `clonefile` strategy.
+
 ## Development
 
 ```bash
 cargo test --workspace --locked
-./scripts/build.sh
+./scripts/install.sh
 ```
 
-The debug CLI is written to `target/debug/rift`.
+The install script builds the optimized CLI and installs it to `${CARGO_HOME:-$HOME/.cargo}/bin/rift`.
 
 ## License
 

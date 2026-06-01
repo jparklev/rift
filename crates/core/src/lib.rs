@@ -1,7 +1,7 @@
 mod copy;
 mod git;
 
-use copy::{CopyStrategy, CowStrategy};
+use copy::Strategy;
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
@@ -23,8 +23,12 @@ pub enum Error {
     Path(String),
     #[error("copy-on-write cloning unavailable: {0}")]
     CowUnavailable(String),
-    #[error("workspace is not a btrfs subvolume: {0}; run `rift init {0}` first")]
+    #[error("workspace is not a btrfs subvolume: {0}")]
     InitializationRequired(PathBuf),
+    #[error("workspace is not initialized: {0}")]
+    WorkspaceNotInitialized(PathBuf),
+    #[error("rift marker is missing: {0}")]
+    MissingMarker(PathBuf),
     #[error("unsupported filesystem entry: {0}")]
     UnsupportedEntry(PathBuf),
     #[error("unsafe Git source: {0}")]
@@ -37,8 +41,6 @@ pub enum Error {
     UnknownMarker(PathBuf),
     #[error("rift directory already exists: {0}")]
     AlreadyExists(PathBuf),
-    #[error("cannot remove the original registered workspace: {0}")]
-    CannotRemoveRoot(PathBuf),
     #[error("cannot remove subtree while a recorded rift path is missing: {0}")]
     MissingRift(PathBuf),
     #[error("cannot copy a workspace into itself: {0}")]
@@ -51,6 +53,17 @@ pub struct Create {
     pub into: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitProgress {
+    CreatingSubvolume,
+    ImportingWorkspace,
+    ImportedEntries { entries: u64 },
+    ActivatingWorkspace,
+    RemovingOriginal,
+    RestoringMarker,
+    RegisteringWorkspace,
+}
+
 #[derive(Clone)]
 struct Record {
     id: String,
@@ -60,7 +73,7 @@ struct Record {
 
 pub struct Manager {
     database: Connection,
-    copier: Box<dyn CopyStrategy>,
+    strategy: Box<dyn Strategy>,
 }
 
 impl Manager {
@@ -73,10 +86,10 @@ impl Manager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::with_copier(path, Box::new(CowStrategy))
+        Self::with_strategy(path, copy::default_strategy())
     }
 
-    fn with_copier(path: impl AsRef<Path>, copier: Box<dyn CopyStrategy>) -> Result<Self> {
+    fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
         let database = Connection::open(path)?;
         database.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -93,13 +106,14 @@ impl Manager {
                 removed_at INTEGER NOT NULL
               );",
         )?;
-        Ok(Self { database, copier })
+        Ok(Self { database, strategy })
     }
 
     pub fn create(&mut self, input: Create) -> Result<PathBuf> {
-        let from = existing_directory(&input.from)?;
+        let requested = existing_directory(&input.from)?;
+        let source = self.workspace_from(&requested)?;
+        let from = source.path.clone();
         let git = git::check_source(&from)?;
-        let (source, register_source) = self.source(&from)?;
         let root = self.root(&source)?;
         let id = Ulid::new().to_string();
         let destination_parent = match input.into {
@@ -120,9 +134,9 @@ impl Manager {
             return Err(Error::AlreadyExists(destination));
         }
 
-        if let Err(error) = self.copier.copy_directory(&from, &destination) {
+        if let Err(error) = self.strategy.copy_directory(&from, &destination) {
             if destination.exists() {
-                let _ = self.copier.remove_directory(&destination);
+                let _ = self.strategy.remove_directory(&destination);
             }
             return Err(error);
         }
@@ -132,13 +146,6 @@ impl Manager {
             if git {
                 git::hide_marker(&destination)?;
                 git::detach_destination(&destination)?;
-            }
-            if register_source {
-                write_marker(&from, &source.id)?;
-                self.database.execute(
-                    "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, NULL, ?2, ?3)",
-                    params![source.id, path_text(&from)?, timestamp()],
-                )?;
             }
             if git {
                 git::hide_marker(&from)?;
@@ -150,27 +157,44 @@ impl Manager {
             Ok(destination.clone())
         })();
         if result.is_err() {
-            let _ = self.copier.remove_directory(&destination);
+            let _ = self.strategy.remove_directory(&destination);
         }
         result
     }
 
-    pub fn init(&mut self, at: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+    pub fn init(&mut self, at: impl AsRef<Path>) -> Result<bool> {
+        self.init_with_progress(at, |_| {})
+    }
+
+    pub fn init_with_progress(
+        &mut self,
+        at: impl AsRef<Path>,
+        mut progress: impl FnMut(InitProgress),
+    ) -> Result<bool> {
         let at = existing_directory(at.as_ref())?;
         let git = git::check_source(&at)?;
         if let Some(record) = self.record_at_optional(&at)? {
+            if read_marker(&at)?.is_none() {
+                progress(InitProgress::RestoringMarker);
+                write_marker(&at, &record.id)?;
+                if git {
+                    git::hide_marker(&at)?;
+                }
+                return Ok(false);
+            }
             verify_marker(&record)?;
-            let backup = self.copier.initialize_directory(&at)?;
+            let converted = self.strategy.initialize_directory(&at, &mut progress)?;
             if git {
                 git::hide_marker(&at)?;
             }
-            return Ok(backup);
+            return Ok(converted);
         }
         if read_marker(&at)?.is_some() {
             return Err(Error::MarkerMismatch(at));
         }
 
-        let backup = self.copier.initialize_directory(&at)?;
+        let converted = self.strategy.initialize_directory(&at, &mut progress)?;
+        progress(InitProgress::RegisteringWorkspace);
         let id = Ulid::new().to_string();
         let result = (|| {
             write_marker(&at, &id)?;
@@ -181,7 +205,7 @@ impl Manager {
                 "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, NULL, ?2, ?3)",
                 params![id, path_text(&at)?, timestamp()],
             )?;
-            Ok(backup.clone())
+            Ok(converted)
         })();
         if result.is_err() {
             let _ = fs::remove_file(marker(&at));
@@ -190,10 +214,9 @@ impl Manager {
     }
 
     pub fn remove(&mut self, at: impl AsRef<Path>) -> Result<()> {
-        let at = existing_directory(at.as_ref())?;
-        let record = self.record_at(&at)?;
+        let record = self.workspace_at(at)?;
         if record.parent_id.is_none() {
-            return Err(Error::CannotRemoveRoot(at));
+            return self.unregister_root(&record);
         }
         verify_marker(&record)?;
         let rows = self.subtree(&record.id, true)?;
@@ -202,12 +225,25 @@ impl Manager {
     }
 
     pub fn remove_all(&mut self, at: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
-        let at = existing_directory(at.as_ref())?;
-        let record = self.record_at(&at)?;
+        let record = self.workspace_at(at)?;
         verify_marker(&record)?;
         let rows = self.subtree(&record.id, false)?;
         self.trash_rows(&rows)?;
         Ok(rows.into_iter().map(|(_, path)| path).collect())
+    }
+
+    fn unregister_root(&mut self, record: &Record) -> Result<()> {
+        verify_marker(record)?;
+        let rows = self.subtree(&record.id, false)?;
+        let existing = rows
+            .into_iter()
+            .filter(|(_, path)| path.exists())
+            .collect::<Vec<_>>();
+        self.trash_rows(&existing)?;
+        fs::remove_file(marker(&record.path))?;
+        self.database
+            .execute("DELETE FROM rift WHERE id = ?1", [&record.id])?;
+        Ok(())
     }
 
     fn subtree(&self, id: &str, include_root: bool) -> Result<Vec<(String, PathBuf)>> {
@@ -282,7 +318,7 @@ impl Manager {
     }
 
     pub fn list(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
-        let record = self.record_at(&existing_directory(of.as_ref())?)?;
+        let record = self.workspace_at(of)?;
         let mut statement = self
             .database
             .prepare("SELECT path FROM rift WHERE parent_id = ?1 ORDER BY created_at, id")?;
@@ -294,7 +330,7 @@ impl Manager {
     }
 
     pub fn ancestors(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
-        let record = self.record_at(&existing_directory(of.as_ref())?)?;
+        let record = self.workspace_at(of)?;
         let mut paths = Vec::new();
         let mut parent_id = record.parent_id;
         while let Some(id) = parent_id {
@@ -323,37 +359,76 @@ impl Manager {
         let mut removed = Vec::new();
         for (id, path) in rows {
             if path.exists() {
-                self.copier.remove_directory(&path)?;
+                self.strategy.remove_directory(&path)?;
             }
             self.database
                 .execute("DELETE FROM trash WHERE id = ?1", [&id])?;
             removed.push(path);
         }
+
+        let mut statement = self.database.prepare("SELECT id, path FROM rift")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut missing = Vec::new();
+        for (id, path) in rows {
+            if path.exists() {
+                continue;
+            }
+            if self
+                .subtree(&id, false)?
+                .iter()
+                .any(|(_, descendant)| descendant.exists())
+            {
+                continue;
+            }
+            missing.push((id, path));
+        }
+        let transaction = self.database.transaction()?;
+        for (id, path) in missing {
+            transaction.execute("DELETE FROM rift WHERE id = ?1", [&id])?;
+            removed.push(path);
+        }
+        transaction.commit()?;
         Ok(removed)
     }
 
-    fn source(&self, path: &Path) -> Result<(Record, bool)> {
-        if let Some(id) = read_marker(path)? {
-            let record = self
-                .record_id(&id)?
-                .ok_or_else(|| Error::UnknownMarker(path.to_path_buf()))?;
-            if record.path != path {
-                return Err(Error::MarkerMismatch(path.to_path_buf()));
+    pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
+        Ok(self.workspace_at(at)?.path)
+    }
+
+    fn workspace_at(&self, path: impl AsRef<Path>) -> Result<Record> {
+        let path = existing_directory(path.as_ref())?;
+        self.workspace_from(&path)
+    }
+
+    fn workspace_from(&self, path: &Path) -> Result<Record> {
+        self.workspace_from_optional(path)?
+            .ok_or_else(|| Error::WorkspaceNotInitialized(path.to_path_buf()))
+    }
+
+    fn workspace_from_optional(&self, path: &Path) -> Result<Option<Record>> {
+        for directory in path.ancestors() {
+            if let Some(id) = read_marker(directory)? {
+                let record = self
+                    .record_id(&id)?
+                    .ok_or_else(|| Error::UnknownMarker(directory.to_path_buf()))?;
+                if record.path != directory {
+                    return Err(Error::MarkerMismatch(directory.to_path_buf()));
+                }
+                return Ok(Some(record));
             }
-            return Ok((record, false));
+            if self.record_at_optional(directory)?.is_some() {
+                return Err(Error::MissingMarker(directory.to_path_buf()));
+            }
         }
-        if self.record_at_optional(path)?.is_some() {
-            return Err(Error::MarkerMismatch(path.to_path_buf()));
-        }
-        let id = Ulid::new().to_string();
-        Ok((
-            Record {
-                id,
-                parent_id: None,
-                path: path.to_path_buf(),
-            },
-            true,
-        ))
+        Ok(None)
     }
 
     fn root(&self, record: &Record) -> Result<Record> {
@@ -364,11 +439,6 @@ impl Manager {
                 .ok_or_else(|| Error::NotManaged(record.path.clone()))?;
         }
         Ok(current)
-    }
-
-    fn record_at(&self, path: &Path) -> Result<Record> {
-        self.record_at_optional(path)?
-            .ok_or_else(|| Error::NotManaged(path.to_path_buf()))
     }
 
     fn record_at_optional(&self, path: &Path) -> Result<Option<Record>> {
@@ -525,7 +595,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn manager(temp: &TempDir) -> Manager {
-        Manager::with_copier(temp.path().join("registry.sqlite"), Box::new(TestStrategy)).unwrap()
+        Manager::with_strategy(temp.path().join("registry.sqlite"), Box::new(TestStrategy)).unwrap()
     }
 
     fn source(temp: &TempDir) -> PathBuf {
@@ -540,6 +610,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -571,10 +642,98 @@ mod tests {
         let source = source(&temp);
         let mut manager = manager(&temp);
 
-        assert!(manager.init(&source).unwrap().is_none());
+        assert!(!manager.init(&source).unwrap());
         assert!(source.join(".rift").exists());
         assert!(manager.list(&source).unwrap().is_empty());
-        assert!(manager.init(&source).unwrap().is_none());
+        assert!(!manager.init(&source).unwrap());
+    }
+
+    #[test]
+    fn init_reports_structured_registration_progress_when_requested() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        let mut progress = Vec::new();
+
+        manager
+            .init_with_progress(&source, |event| progress.push(event))
+            .unwrap();
+
+        assert_eq!(progress, vec![InitProgress::RegisteringWorkspace]);
+    }
+
+    #[test]
+    fn operations_use_the_nearest_ancestor_marker() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let nested = source.join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+
+        let child = manager
+            .create(Create {
+                from: nested,
+                name: Some("nested".into()),
+                into: None,
+            })
+            .unwrap();
+        fs::create_dir(child.join("deep")).unwrap();
+
+        assert_eq!(
+            manager.list(source.join("packages")).unwrap(),
+            vec![child.clone()]
+        );
+        assert_eq!(manager.ancestors(child.join("deep")).unwrap(), vec![source]);
+    }
+
+    #[test]
+    fn operations_without_a_marker_explain_how_to_initialize() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let nested = source.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let manager = manager(&temp);
+
+        assert!(matches!(
+            manager.list(&nested),
+            Err(Error::WorkspaceNotInitialized(path)) if path == nested
+        ));
+    }
+
+    #[test]
+    fn init_restores_a_deleted_marker_for_an_existing_workspace() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let nested = source.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let id = fs::read_to_string(source.join(".rift")).unwrap();
+        fs::remove_file(source.join(".rift")).unwrap();
+
+        assert!(matches!(
+            manager.list(&nested),
+            Err(Error::MissingMarker(path)) if path == source
+        ));
+
+        manager.init(&source).unwrap();
+        assert_eq!(fs::read_to_string(source.join(".rift")).unwrap(), id);
+        assert!(manager.list(&nested).unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_registers_exactly_the_requested_directory() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let nested = source.join("nested");
+        fs::create_dir(&nested).unwrap();
+        run(&source, &["init"]);
+        let mut manager = manager(&temp);
+
+        manager.init(&nested).unwrap();
+        assert!(!source.join(".rift").exists());
+        assert!(nested.join(".rift").exists());
     }
 
     #[test]
@@ -582,6 +741,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
 
         let destination = manager
             .create(Create {
@@ -615,6 +775,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -660,9 +821,78 @@ mod tests {
         assert_eq!(deleted.len(), 2);
         assert!(!first_trash.exists());
         assert!(!second_trash.exists());
+    }
+
+    #[test]
+    fn remove_on_a_registered_root_unregisters_it_and_trashes_descendants() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        let first_trash = trash_path(
+            fs::read_to_string(first.join(".rift")).unwrap().trim(),
+            &first,
+        )
+        .unwrap();
+        let second_trash = trash_path(
+            fs::read_to_string(second.join(".rift")).unwrap().trim(),
+            &second,
+        )
+        .unwrap();
+
+        manager.remove(&source).unwrap();
+
+        assert!(source.exists());
+        assert!(!source.join(".rift").exists());
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(first_trash.exists());
+        assert!(second_trash.exists());
         assert!(matches!(
-            manager.remove(&source),
-            Err(Error::CannotRemoveRoot(_))
+            manager.list(&source),
+            Err(Error::WorkspaceNotInitialized(_))
+        ));
+        let deleted = manager.gc().unwrap();
+        assert!(deleted.contains(&first_trash));
+        assert!(deleted.contains(&second_trash));
+    }
+
+    #[test]
+    fn remove_on_a_registered_root_tolerates_missing_descendants() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        fs::remove_dir_all(&first).unwrap();
+
+        manager.remove(&source).unwrap();
+
+        assert!(source.exists());
+        assert!(!source.join(".rift").exists());
+        assert!(matches!(
+            manager.list(&source),
+            Err(Error::WorkspaceNotInitialized(_))
         ));
     }
 
@@ -671,6 +901,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -711,6 +942,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source,
@@ -736,6 +968,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -761,6 +994,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -793,6 +1027,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
         let first = manager
             .create(Create {
                 from: source.clone(),
@@ -812,6 +1047,65 @@ mod tests {
     }
 
     #[test]
+    fn gc_prunes_active_entries_deleted_outside_rift() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        fs::remove_dir_all(&first).unwrap();
+        fs::remove_dir_all(&second).unwrap();
+
+        let removed = manager.gc().unwrap();
+        assert!(removed.contains(&first));
+        assert!(removed.contains(&second));
+        assert!(manager.list(&source).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_preserves_missing_active_parent_with_an_existing_descendant() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let first = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("first".into()),
+                into: None,
+            })
+            .unwrap();
+        let second = manager
+            .create(Create {
+                from: first.clone(),
+                name: Some("second".into()),
+                into: None,
+            })
+            .unwrap();
+        fs::remove_dir_all(&first).unwrap();
+
+        assert!(manager.gc().unwrap().is_empty());
+        assert_eq!(manager.list(&source).unwrap(), vec![first]);
+        assert_eq!(
+            manager.ancestors(&second).unwrap(),
+            vec![temp.path().join(".rifts/app/first"), source]
+        );
+    }
+
+    #[test]
     fn git_copy_detaches_head_and_preserves_dirty_state() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
@@ -824,6 +1118,7 @@ mod tests {
         run(&source, &["add", "file.txt"]);
         fs::write(source.join("untracked.txt"), "new").unwrap();
         let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
 
         let destination = manager
             .create(Create {
@@ -873,11 +1168,9 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_git_source_is_rejected_without_registering_it() {
+    fn create_requires_an_initialized_workspace() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
-        run(&source, &["init"]);
-        fs::write(source.join(".git/MERGE_HEAD"), "commit").unwrap();
         let mut manager = manager(&temp);
 
         assert!(matches!(
@@ -886,20 +1179,40 @@ mod tests {
                 name: Some("unsafe".into()),
                 into: None,
             }),
-            Err(Error::UnsafeGit(_))
+            Err(Error::WorkspaceNotInitialized(_))
         ));
         assert!(!source.join(".rift").exists());
     }
 
     #[test]
-    fn unavailable_cow_does_not_register_the_source() {
+    fn unsafe_git_source_is_rejected_after_initialization() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
-        let mut manager = Manager::with_copier(
+        run(&source, &["init"]);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        fs::write(source.join(".git/MERGE_HEAD"), "commit").unwrap();
+
+        assert!(matches!(
+            manager.create(Create {
+                from: source,
+                name: Some("unsafe".into()),
+                into: None,
+            }),
+            Err(Error::UnsafeGit(_))
+        ));
+    }
+
+    #[test]
+    fn unavailable_cow_does_not_create_a_child() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = Manager::with_strategy(
             temp.path().join("registry.sqlite"),
             Box::new(FailureStrategy),
         )
         .unwrap();
+        manager.init(&source).unwrap();
 
         assert!(matches!(
             manager.create(Create {
@@ -909,8 +1222,8 @@ mod tests {
             }),
             Err(Error::CowUnavailable(_))
         ));
-        assert!(!source.join(".rift").exists());
-        assert!(manager.record_at_optional(&source).unwrap().is_none());
+        assert!(source.join(".rift").exists());
+        assert!(manager.list(&source).unwrap().is_empty());
     }
 
     fn run(path: &Path, args: &[&str]) {

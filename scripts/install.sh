@@ -4,4 +4,4 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-cargo build --package rift-cli --locked "$@"
+cargo install --path crates/cli --root "${CARGO_HOME:-$HOME/.cargo}" --force --locked
