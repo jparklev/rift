@@ -14,4 +14,14 @@ ulid.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "create"
+harness = false
+
+[[bench]]
+name = "compare"
+harness = false

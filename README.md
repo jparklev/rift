@@ -147,6 +147,37 @@ cargo test --workspace --locked
 
 `scripts/install.sh` installs an optimized CLI binary to `${CARGO_HOME:-$HOME/.cargo}/bin/rift`.
 
+### Benchmark
+
+Benchmark a single real `rift create` operation against a directory:
+
+```bash
+cargo bench --bench create -- /path/to/linux
+```
+
+The benchmark initializes the supplied directory before timing, times only creation of the new rift, and then removes the created workspace outside the measured interval. On first use, initialization of an ordinary Linux btrfs directory converts it into a subvolume before measurement. The benchmark uses the production filesystem strategy, so results on macOS measure APFS cloning and results on Linux require and measure btrfs snapshots.
+
+Establish a baseline by measuring multiple independent rift creations and writing an aggregate machine-readable result file. Keep results outside the source workspace so they do not alter future measurements:
+
+```bash
+cargo bench --bench create -- /path/to/linux --samples 10 --output /path/to/results/baseline.json
+```
+
+The JSON result includes each timing sample and the median, minimum, and maximum elapsed time. A future experiment loop can run the same command in candidate workspaces and compare their median results to this baseline.
+
+Compare multiple candidate `rift` code workspaces that contain this benchmark target:
+
+```bash
+cargo bench --bench compare -- /path/to/linux \
+  --candidate /path/to/rift-baseline \
+  --candidate /path/to/rift-candidate-a \
+  --candidate /path/to/rift-candidate-b \
+  --samples 10 \
+  --output /path/to/results/create-run-01
+```
+
+The comparison runner invokes each candidate's optimized `create` benchmark against the same workload, writes `candidate-01.json`, `candidate-02.json`, and so on, then writes `summary.json` with candidates ranked by median creation time. Include the unchanged workspace as one candidate when you need a baseline in the ranking.
+
 ## License
 
 MIT
