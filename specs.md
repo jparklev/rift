@@ -191,3 +191,5 @@ The CLI and language bindings should remain thin and expose the same API semanti
 The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
 
 For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted.
+
+The CLI may provide opt-in Bash/Zsh integration through `eval "$(rift shell-init <shell>)"`. The resulting shell function delegates filesystem and registry operations to the executable, then changes the caller's working directory after `init`, `create`, or removal of the current rift. This shell behavior is not part of the native library or FFI APIs.
