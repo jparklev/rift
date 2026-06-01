@@ -10,7 +10,9 @@ if (!version) {
 }
 
 for (const entry of fs.readdirSync("npm")) {
-  const manifest = JSON.parse(fs.readFileSync(path.join("npm", entry, "package.json"), "utf8"))
+  const manifestPath = path.join("npm", entry, "package.json")
+  if (!fs.existsSync(manifestPath)) continue
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"))
   if (manifest.version !== version) {
     throw new Error(`${manifest.name} version ${manifest.version} does not match ${version}`)
   }

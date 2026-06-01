@@ -15,7 +15,7 @@ if (!platform || !arch) {
   process.exit(1)
 }
 
-const name = `rift-snapshot-${platform}-${arch}`
+const name = `rift-${platform}-${arch}`
 let binary
 try {
   const manifest = require.resolve(`${name}/package.json`)

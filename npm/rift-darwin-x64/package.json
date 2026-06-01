@@ -1,14 +1,14 @@
 {
-  "name": "rift-snapshot-windows-x64",
+  "name": "rift-darwin-x64",
   "version": "0.0.5",
-  "description": "Rift native binary for Windows x64",
+  "description": "Rift native binary for macOS x64",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/anomalyco/rift.git"
   },
   "files": ["bin"],
-  "os": ["win32"],
+  "os": ["darwin"],
   "cpu": ["x64"],
   "preferUnplugged": true,
   "publishConfig": { "provenance": true }

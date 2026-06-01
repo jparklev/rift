@@ -24,10 +24,10 @@
     "x64"
   ],
   "optionalDependencies": {
-    "rift-snapshot-darwin-arm64": "0.0.5",
-    "rift-snapshot-darwin-x64": "0.0.5",
-    "rift-snapshot-linux-x64": "0.0.5",
-    "rift-snapshot-windows-x64": "0.0.5"
+    "rift-darwin-arm64": "0.0.5",
+    "rift-darwin-x64": "0.0.5",
+    "rift-linux-x64": "0.0.5",
+    "rift-windows-x64": "0.0.5"
   },
   "publishConfig": {
     "provenance": true

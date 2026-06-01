@@ -3,3 +3,7 @@
 /npm/rift-snapshot-darwin-x64/bin/
 /npm/rift-snapshot-darwin-arm64/bin/
 /npm/rift-snapshot-windows-x64/bin/
+/npm/rift-linux-x64/bin/
+/npm/rift-darwin-x64/bin/
+/npm/rift-darwin-arm64/bin/
+/npm/rift-windows-x64/bin/

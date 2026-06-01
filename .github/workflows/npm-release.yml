@@ -36,19 +36,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            package: rift-snapshot-linux-x64
+            package: rift-linux-x64
             executable: rift
           - os: macos-14
             target: x86_64-apple-darwin
-            package: rift-snapshot-darwin-x64
+            package: rift-darwin-x64
             executable: rift
           - os: macos-14
             target: aarch64-apple-darwin
-            package: rift-snapshot-darwin-arm64
+            package: rift-darwin-arm64
             executable: rift
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            package: rift-snapshot-windows-x64
+            package: rift-windows-x64
             executable: rift.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -103,7 +103,7 @@ jobs:
           path: npm-built
 
       - name: Restore native executable permissions
-        run: chmod +x npm-built/npm-rift-snapshot-linux-x64/bin/rift npm-built/npm-rift-snapshot-darwin-x64/bin/rift npm-built/npm-rift-snapshot-darwin-arm64/bin/rift
+        run: chmod +x npm-built/npm-rift-linux-x64/bin/rift npm-built/npm-rift-darwin-x64/bin/rift npm-built/npm-rift-darwin-arm64/bin/rift
 
       - name: Publish native packages
         shell: bash
