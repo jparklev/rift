@@ -1,6 +1,0 @@
-#!/bin/sh
-echo "Error: rift-snapshot's postinstall script was not run." >&2
-echo "" >&2
-echo "Reinstall rift-snapshot with lifecycle scripts enabled, or run:" >&2
-echo "  node node_modules/rift-snapshot/postinstall.mjs" >&2
-exit 1

@@ -7,16 +7,13 @@
     "type": "git",
     "url": "git+https://github.com/anomalyco/rift.git"
   },
+  "type": "module",
   "bin": {
-    "rift": "bin/rift.exe"
+    "rift": "bin/rift.js"
   },
   "files": [
-    "bin",
-    "postinstall.mjs"
+    "bin"
   ],
-  "scripts": {
-    "postinstall": "node ./postinstall.mjs"
-  },
   "os": [
     "darwin",
     "linux",
