@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rift::{Create, Link, Manager};
+use rift::{Create, Manager};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -27,11 +27,6 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         all: bool,
-    },
-    Link {
-        at: Option<PathBuf>,
-        #[arg(long)]
-        to: Option<PathBuf>,
     },
     List {
         of: Option<PathBuf>,
@@ -95,10 +90,6 @@ fn run() -> rift::Result<()> {
                 manager.remove(at)?;
             }
         }
-        Command::Link { at, to } => manager.link(Link {
-            at: at.unwrap_or(std::env::current_dir()?),
-            to,
-        })?,
         Command::List { of } => {
             for path in manager.list(of.unwrap_or(std::env::current_dir()?))? {
                 println!("{}", path.display());

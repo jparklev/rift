@@ -39,12 +39,8 @@ pub enum Error {
     AlreadyExists(PathBuf),
     #[error("cannot remove the original registered workspace: {0}")]
     CannotRemoveRoot(PathBuf),
-    #[error("cannot reparent the original registered workspace: {0}")]
-    CannotLinkRoot(PathBuf),
     #[error("cannot remove subtree while a recorded rift path is missing: {0}")]
     MissingRift(PathBuf),
-    #[error("cannot link a rift to itself or its descendant")]
-    Cycle,
     #[error("cannot copy a workspace into itself: {0}")]
     InsideSource(PathBuf),
 }
@@ -53,11 +49,6 @@ pub struct Create {
     pub from: PathBuf,
     pub name: Option<String>,
     pub into: Option<PathBuf>,
-}
-
-pub struct Link {
-    pub at: PathBuf,
-    pub to: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -290,53 +281,6 @@ impl Manager {
         result
     }
 
-    pub fn link(&mut self, input: Link) -> Result<()> {
-        let at = existing_directory(&input.at)?;
-        let record = match read_marker(&at)? {
-            Some(id) => {
-                let record = self
-                    .record_id(&id)?
-                    .ok_or_else(|| Error::UnknownMarker(at.clone()))?;
-                if record.path != at {
-                    if record.path.exists() {
-                        return Err(Error::MarkerMismatch(at));
-                    }
-                    self.database.execute(
-                        "UPDATE rift SET path = ?1 WHERE id = ?2",
-                        params![path_text(&at)?, record.id],
-                    )?;
-                }
-                Record {
-                    path: at.clone(),
-                    ..record
-                }
-            }
-            None => {
-                let record = self.record_at(&at)?;
-                write_marker(&at, &record.id)?;
-                record
-            }
-        };
-        if at.join(".git").is_dir() {
-            git::hide_marker(&at)?;
-        }
-        let Some(to) = input.to else {
-            return Ok(());
-        };
-        if record.parent_id.is_none() {
-            return Err(Error::CannotLinkRoot(at));
-        }
-        let parent = self.record_at(&existing_directory(&to)?)?;
-        if parent.id == record.id || self.is_descendant(&parent.id, &record.id)? {
-            return Err(Error::Cycle);
-        }
-        self.database.execute(
-            "UPDATE rift SET parent_id = ?1 WHERE id = ?2",
-            params![parent.id, record.id],
-        )?;
-        Ok(())
-    }
-
     pub fn list(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let record = self.record_at(&existing_directory(of.as_ref())?)?;
         let mut statement = self
@@ -459,18 +403,6 @@ impl Manager {
             )
             .optional()
             .map_err(Error::from)
-    }
-
-    fn is_descendant(&self, candidate: &str, of: &str) -> Result<bool> {
-        Ok(self.database.query_row(
-            "WITH RECURSIVE descendants(id) AS (
-               SELECT id FROM rift WHERE parent_id = ?1
-               UNION ALL
-               SELECT rift.id FROM rift JOIN descendants ON rift.parent_id = descendants.id
-             ) SELECT EXISTS(SELECT 1 FROM descendants WHERE id = ?2)",
-            params![of, candidate],
-            |row| row.get(0),
-        )?)
     }
 }
 
@@ -877,75 +809,6 @@ mod tests {
             .unwrap();
         assert!(manager.gc().unwrap().is_empty());
         assert_eq!(manager.ancestors(&second).unwrap(), vec![first, source]);
-    }
-
-    #[test]
-    fn link_restores_moves_markers_and_reparents() {
-        let temp = TempDir::new().unwrap();
-        let source = source(&temp);
-        let mut manager = manager(&temp);
-        let first = manager
-            .create(Create {
-                from: source.clone(),
-                name: Some("first".into()),
-                into: None,
-            })
-            .unwrap();
-        let second = manager
-            .create(Create {
-                from: source.clone(),
-                name: Some("second".into()),
-                into: None,
-            })
-            .unwrap();
-        let moved = temp.path().join("moved");
-        fs::rename(&second, &moved).unwrap();
-
-        manager
-            .link(Link {
-                at: moved.clone(),
-                to: Some(first.clone()),
-            })
-            .unwrap();
-        assert_eq!(
-            manager.ancestors(&moved).unwrap(),
-            vec![first, source.clone()]
-        );
-
-        fs::remove_file(source.join(".rift")).unwrap();
-        manager
-            .link(Link {
-                at: source.clone(),
-                to: None,
-            })
-            .unwrap();
-        assert!(source.join(".rift").exists());
-    }
-
-    #[test]
-    fn link_does_not_reparent_a_registered_source() {
-        let temp = TempDir::new().unwrap();
-        let source = source(&temp);
-        let mut manager = manager(&temp);
-        let child = manager
-            .create(Create {
-                from: source.clone(),
-                name: Some("child".into()),
-                into: None,
-            })
-            .unwrap();
-
-        assert!(matches!(
-            manager.link(Link {
-                at: source.clone(),
-                to: Some(child),
-            }),
-            Err(Error::CannotLinkRoot(_))
-        ));
-        assert!(matches!(
-            manager.remove(&source),
-            Err(Error::CannotRemoveRoot(_))
-        ));
     }
 
     #[test]

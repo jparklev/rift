@@ -74,32 +74,9 @@ remove(input: {
 - When `all` is true, preserve `at` and delete every managed descendant. In this mode `at` may be the registered source root.
 - Resolve all descendants through `parent_id` and move their directories deepest-first.
 - Verify each existing directory's `.rift` marker before deleting it.
-- Refuse removal if any descendant path is missing, because it may be a moved workspace that has not been linked yet.
+- Refuse removal if any descendant path is missing, because the registered active tree no longer matches the filesystem.
 - Move each removed rift from `<storage-parent>/<name>` to `<storage-parent>/.trash/<id>-<name>` so custom `into` storage remains on the same filesystem.
 - After successful filesystem moves, delete the active tree records and insert trash records for garbage collection.
-
-### `link`
-
-```ts
-link(input: {
-  at: AbsolutePath
-  to?: AbsolutePath
-}): void
-```
-
-`link` reconnects a moved managed rift to its registry record and can change its parent.
-
-- Read the ULID from `.rift` at `at`.
-- Look up the existing rift record by ULID.
-- If its recorded path is `at`, leave its location unchanged.
-- If its recorded path is different and missing, update it to `at`.
-- If its recorded path is different and still exists, fail because this is a duplicate identity, not a move.
-- If the ULID is unknown to the database, fail; `.rift` alone does not include the ancestry needed to rebuild the record.
-- If `.rift` is missing, look up `at` by its absolute path. If it matches an existing record, recreate the marker with that record's ULID.
-- If `.rift` is missing and `at` does not match an existing record, fail. A moved workspace without its marker cannot be identified safely.
-- If `to` is provided, set the rift's parent to the managed rift at `to`.
-- Refuse `to` for an original registered workspace; only rifts created by this tool can be reparented.
-- Refuse `to` if it is `at` or a descendant of `at`, because reparenting must not create a cycle.
 
 ### `list`
 
@@ -161,21 +138,13 @@ CREATE TABLE trash (
 - Every managed rift has a stable generated `id`.
 - `id` is a ULID generated when the workspace is first registered or created.
 - `id` is stored in the central database and in a `.rift` marker file at the root of the workspace.
-- `.rift` contains the rift ULID and allows a moved workspace to be rediscovered and verified against the database.
+- `.rift` contains the rift ULID and allows a workspace directory to be verified against the database.
 - When a managed workspace is copied, the copied `.rift` marker is replaced with the new workspace's ULID.
 - The original registered workspace has `parent_id = NULL`.
 - A created rift has `parent_id` set to the source rift `id`.
 - `path` is its current location, not its identity.
 - Provenance is a rooted tree. Descendants of any rift can be listed through recursive queries over `parent_id`.
 - `remove` moves a whole active subtree into trash, so no surviving active record depends on deleted ancestry.
-
-### Moved Rifts
-
-If a rift is moved outside the tool, its recorded path becomes missing. The tool cannot discover an arbitrary new location without being given a path or scanning a configured directory.
-
-When `link` is run against a directory containing `.rift`, the tool reads its ULID and reconciles the database path if the recorded path no longer exists.
-
-If both the recorded path and the provided path exist with the same ULID, the tool must refuse automatic reconciliation because the directory was copied without assigning a new identity.
 
 ## Git Integration
 
@@ -219,4 +188,4 @@ The project ships four interfaces backed by the same implementation and metadata
 
 The CLI and language bindings should remain thin and expose the same API semantics as the native library.
 
-For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift link`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted.
+For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted.
