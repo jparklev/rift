@@ -1186,6 +1186,40 @@ mod tests {
     }
 
     #[test]
+    fn git_copy_peels_symbolic_tag_heads_to_commits() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        run(&source, &["init"]);
+        run(&source, &["config", "user.email", "test@example.com"]);
+        run(&source, &["config", "user.name", "Test"]);
+        run(&source, &["add", "file.txt"]);
+        run(&source, &["commit", "-m", "initial"]);
+        run(&source, &["tag", "-a", "release", "-m", "release"]);
+        run(&source, &["symbolic-ref", "HEAD", "refs/tags/release"]);
+        let expected = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .output()
+            .unwrap();
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+
+        let destination = manager
+            .create(Create {
+                from: source,
+                name: Some("tag-head".into()),
+                into: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join(".git/HEAD")).unwrap(),
+            format!("{}\n", String::from_utf8_lossy(&expected.stdout).trim())
+        );
+    }
+
+    #[test]
     fn create_requires_an_initialized_workspace() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);

@@ -65,6 +65,14 @@ pub(crate) fn hide_marker(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn detach_destination(path: &Path) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Avoid process startup when libgit2 understands the repository;
+    // the Git CLI remains the authority for layouts it cannot resolve.
+    if let Some(commit) = resolve_head_commit(path) {
+        fs::write(path.join(".git").join("HEAD"), format!("{commit}\n"))?;
+        return Ok(());
+    }
+
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
@@ -76,6 +84,17 @@ pub(crate) fn detach_destination(path: &Path) -> Result<()> {
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     fs::write(path.join(".git").join("HEAD"), format!("{commit}\n"))?;
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_head_commit(path: &Path) -> Option<git2::Oid> {
+    let repository = git2::Repository::open(path).ok()?;
+    repository
+        .head()
+        .ok()?
+        .peel_to_commit()
+        .ok()
+        .map(|commit| commit.id())
 }
 
 #[cfg(test)]
