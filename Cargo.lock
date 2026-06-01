@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "dirs",
  "libc",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "clap",
  "rift",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ffi"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "rift",
  "serde",
