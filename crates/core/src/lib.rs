@@ -1,11 +1,11 @@
-mod copy;
 mod git;
+mod strategy;
 
-use copy::Strategy;
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
+use strategy::Strategy;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -86,7 +86,7 @@ impl Manager {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::with_strategy(path, copy::default_strategy())
+        Self::with_strategy(path, strategy::default_strategy())
     }
 
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
@@ -587,7 +587,7 @@ fn timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copy::{FailureStrategy, Strategy, TestStrategy};
+    use crate::strategy::{FailureStrategy, Strategy, TestStrategy};
     use std::cell::Cell;
     use std::process::Command;
     use std::rc::Rc;
@@ -659,6 +659,138 @@ mod tests {
             .unwrap();
 
         assert_eq!(progress, vec![InitProgress::RegisteringWorkspace]);
+    }
+
+    #[test]
+    fn create_supports_custom_storage_and_rejects_invalid_destinations() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let custom = temp.path().join("custom");
+        let child = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("custom".into()),
+                into: Some(custom.clone()),
+            })
+            .unwrap();
+        assert_eq!(child, custom.join("custom"));
+        assert!(matches!(
+            manager.create(Create {
+                from: source.clone(),
+                name: Some("custom".into()),
+                into: Some(custom),
+            }),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            manager.create(Create {
+                from: source.clone(),
+                name: Some("..".into()),
+                into: None,
+            }),
+            Err(Error::Path(_))
+        ));
+        assert!(matches!(
+            manager.create(Create {
+                from: source.clone(),
+                name: Some("inside".into()),
+                into: Some(source.join("nested")),
+            }),
+            Err(Error::InsideSource(_))
+        ));
+        assert!(matches!(
+            manager.create(Create {
+                from: source.join("file.txt"),
+                name: Some("file".into()),
+                into: None,
+            }),
+            Err(Error::Path(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_and_unknown_markers_are_rejected() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let nested = source.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        fs::write(source.join(".rift"), "unknown\n").unwrap();
+        assert!(matches!(
+            manager.list(&nested),
+            Err(Error::UnknownMarker(_))
+        ));
+
+        let id = manager.record_at_optional(&source).unwrap().unwrap().id;
+        fs::write(source.join(".rift"), format!("{id}\n")).unwrap();
+        let other = temp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join(".rift"), format!("{id}\n")).unwrap();
+        assert!(matches!(
+            manager.list(&other),
+            Err(Error::MarkerMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn removal_rejects_marker_mismatch_and_existing_trash_target() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let child = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("child".into()),
+                into: None,
+            })
+            .unwrap();
+        let id = fs::read_to_string(child.join(".rift")).unwrap();
+        fs::write(child.join(".rift"), "wrong\n").unwrap();
+        assert!(matches!(
+            manager.remove(&child),
+            Err(Error::UnknownMarker(_))
+        ));
+        fs::write(
+            child.join(".rift"),
+            fs::read_to_string(source.join(".rift")).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.remove(&child),
+            Err(Error::MarkerMismatch(_))
+        ));
+        fs::write(child.join(".rift"), &id).unwrap();
+        let trash = trash_path(id.trim(), &child).unwrap();
+        fs::create_dir_all(&trash).unwrap();
+        assert!(matches!(
+            manager.remove(&child),
+            Err(Error::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn gc_forgets_a_trashed_path_already_removed_on_disk() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut manager = manager(&temp);
+        manager.init(&source).unwrap();
+        let child = manager
+            .create(Create {
+                from: source,
+                name: Some("child".into()),
+                into: None,
+            })
+            .unwrap();
+        let id = fs::read_to_string(child.join(".rift")).unwrap();
+        let trash = trash_path(id.trim(), &child).unwrap();
+        manager.remove(&child).unwrap();
+        fs::remove_dir_all(&trash).unwrap();
+
+        assert_eq!(manager.gc().unwrap(), vec![trash]);
     }
 
     #[test]

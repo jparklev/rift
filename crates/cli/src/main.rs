@@ -55,7 +55,7 @@ enum Command {
     Remove {
         at: Option<PathBuf>,
         #[arg(long)]
-        all: bool,
+        children: bool,
         #[arg(short = 'f', long)]
         force: bool,
     },
@@ -110,16 +110,11 @@ fn run() -> Result<()> {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
-            let mut initializing = existing.is_none() && missing_marker.is_none();
-            if initializing {
-                eprintln!("Initializing  {}\n", at.display());
-            }
+            let mut converting = false;
             let converted = manager.init_with_progress(&at, |progress| match progress {
                 InitProgress::CreatingSubvolume => {
-                    if !initializing {
-                        eprintln!("Initializing  {}\n", at.display());
-                        initializing = true;
-                    }
+                    converting = true;
+                    eprintln!("Initializing  {}\n", at.display());
                     eprintln!("First-time setup can take a moment.");
                     eprintln!("New rifts will be instant.\n");
                     eprintln!("Creating BTRFS subvolume...");
@@ -132,7 +127,11 @@ fn run() -> Result<()> {
                 | InitProgress::RemovingOriginal => {}
             })?;
             if converted {
-                eprintln!("\nReady  {}", at.display());
+                if converting {
+                    eprintln!("\nReady  {}", at.display());
+                } else {
+                    eprintln!("Ready  {}", at.display());
+                }
                 if initialized_from_inside {
                     if cli.shell_cwd {
                         println!("{}", at.display());
@@ -148,7 +147,7 @@ fn run() -> Result<()> {
             } else if let Some(existing) = existing {
                 eprintln!("Already initialized  {}", existing.display());
             } else {
-                eprintln!("\nReady  {}", at.display());
+                eprintln!("Ready  {}", at.display());
             }
         }
         Command::Create { from, name, into } => {
@@ -162,10 +161,14 @@ fn run() -> Result<()> {
             }
             println!("{}", destination.display());
         }
-        Command::Remove { at, all, force } => {
+        Command::Remove {
+            at,
+            children,
+            force,
+        } => {
             let at = manager.workspace(at.unwrap_or(std::env::current_dir()?))?;
             let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
-            if all {
+            if children {
                 let removed = manager.remove_all(&at)?;
                 for path in &removed {
                     if cli.shell_cwd {

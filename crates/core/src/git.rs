@@ -65,3 +65,65 @@ pub(crate) fn detach_destination(path: &Path) -> Result<()> {
     fs::write(path.join(".git").join("HEAD"), format!("{commit}\n"))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn linked_worktree_marker_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join(".git"), "gitdir: elsewhere").unwrap();
+
+        assert!(matches!(
+            check_source(temp.path()),
+            Err(Error::UnsafeGit(_))
+        ));
+    }
+
+    #[test]
+    fn hide_marker_creates_and_appends_exclude_cleanly() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join(".git")).unwrap();
+
+        hide_marker(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
+            "/.rift\n"
+        );
+        fs::write(temp.path().join(".git/info/exclude"), "existing").unwrap();
+        hide_marker(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
+            "existing\n/.rift\n"
+        );
+        hide_marker(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap(),
+            "existing\n/.rift\n"
+        );
+    }
+
+    #[test]
+    fn detach_does_nothing_for_a_repository_without_a_commit() {
+        let temp = TempDir::new().unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = fs::read_to_string(temp.path().join(".git/HEAD")).unwrap();
+
+        detach_destination(temp.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/HEAD")).unwrap(),
+            head
+        );
+    }
+}

@@ -1,41 +1,11 @@
+use super::Strategy;
 use crate::{Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
-#[cfg(any(test, target_os = "linux"))]
 use walkdir::WalkDir;
 
-pub(crate) trait Strategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()>;
+pub(super) struct BtrfsStrategy;
 
-    fn initialize_directory(
-        &self,
-        _path: &Path,
-        _progress: &mut dyn FnMut(InitProgress),
-    ) -> Result<bool> {
-        Ok(false)
-    }
-
-    fn remove_directory(&self, path: &Path) -> Result<()> {
-        fs::remove_dir_all(path)?;
-        Ok(())
-    }
-}
-
-pub(crate) fn default_strategy() -> Box<dyn Strategy> {
-    #[cfg(target_os = "linux")]
-    return Box::new(BtrfsStrategy);
-
-    #[cfg(target_os = "macos")]
-    return Box::new(ApfsStrategy);
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return Box::new(UnsupportedStrategy);
-}
-
-#[cfg(target_os = "linux")]
-struct BtrfsStrategy;
-
-#[cfg(target_os = "linux")]
 impl Strategy for BtrfsStrategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
         copy_directory_linux(from, to)
@@ -54,49 +24,6 @@ impl Strategy for BtrfsStrategy {
     }
 }
 
-#[cfg(target_os = "macos")]
-struct ApfsStrategy;
-
-#[cfg(target_os = "macos")]
-impl Strategy for ApfsStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
-        copy_directory_macos(from, to)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-struct UnsupportedStrategy;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-impl Strategy for UnsupportedStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Err(Error::CowUnavailable(
-            "no copy-on-write strategy has been implemented for this platform".into(),
-        ))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn copy_directory_macos(from: &Path, to: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let source = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| Error::Path(format!("path contains a null byte: {}", from.display())))?;
-    let destination = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| Error::Path(format!("path contains a null byte: {}", to.display())))?;
-    let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) };
-    if result == 0 {
-        return Ok(());
-    }
-    Err(Error::CowUnavailable(format!(
-        "failed to clone {}: {}",
-        from.display(),
-        std::io::Error::last_os_error()
-    )))
-}
-
-#[cfg(target_os = "linux")]
 fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
     if !is_btrfs_filesystem(from)? {
         return Err(Error::CowUnavailable(format!(
@@ -480,58 +407,184 @@ fn btrfs_path_ioctl(
     )))
 }
 
-#[cfg(all(test, unix))]
-fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
-    Ok(())
-}
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use tempfile::{Builder, TempDir};
 
-#[cfg(all(test, windows))]
-fn copy_symlink(from: &Path, to: &Path) -> Result<()> {
-    let target = fs::read_link(from)?;
-    if fs::metadata(from)?.is_dir() {
-        std::os::windows::fs::symlink_dir(target, to)?;
-        return Ok(());
+    fn btrfs_temp() -> Option<TempDir> {
+        let temp = Builder::new()
+            .prefix(".rift-core-test-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        is_btrfs_filesystem(temp.path()).unwrap().then_some(temp)
     }
-    std::os::windows::fs::symlink_file(target, to)?;
-    Ok(())
-}
 
-#[cfg(test)]
-pub(crate) struct TestStrategy;
-
-#[cfg(test)]
-impl Strategy for TestStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
-        fs::create_dir(to)?;
-        for entry in WalkDir::new(from).min_depth(1).follow_links(false) {
-            let entry = entry?;
-            let destination = to.join(
-                entry
-                    .path()
-                    .strip_prefix(from)
-                    .map_err(|error| Error::Path(error.to_string()))?,
+    #[test]
+    fn btrfs_integration_environment_is_available() {
+        if std::env::var_os("RIFT_REQUIRE_BTRFS_TESTS").is_some() {
+            assert!(
+                btrfs_temp().is_some(),
+                "RIFT_REQUIRE_BTRFS_TESTS requires the checkout filesystem to be btrfs"
             );
-            if entry.file_type().is_dir() {
-                fs::create_dir(&destination)?;
-                continue;
-            }
-            if entry.file_type().is_symlink() {
-                copy_symlink(entry.path(), &destination)?;
-                continue;
-            }
-            fs::copy(entry.path(), destination)?;
         }
-        Ok(())
     }
-}
 
-#[cfg(test)]
-pub(crate) struct FailureStrategy;
+    fn set_xattr(path: &Path, name: &str, value: &[u8]) {
+        let path = c_path(path).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::lsetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            },
+            0
+        );
+    }
 
-#[cfg(test)]
-impl Strategy for FailureStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
-        Err(Error::CowUnavailable("test failure".into()))
+    fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
+        let path = c_path(path).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        let size =
+            unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(size >= 0);
+        let mut value = vec![0; size as usize];
+        assert_eq!(
+            unsafe {
+                libc::lgetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            },
+            size
+        );
+        value
+    }
+
+    #[test]
+    fn native_init_imports_files_links_metadata_and_progress() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        let nested = source.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = nested.join("file.txt");
+        fs::write(&file, "hello").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        set_xattr(&file, "user.rift_test", b"xattr");
+        fs::hard_link(&file, nested.join("hard.txt")).unwrap();
+        std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
+        let mut progress = Vec::new();
+
+        assert!(initialize_directory_linux(&source, &mut |event| progress.push(event)).unwrap());
+        assert!(is_btrfs_subvolume(&source).unwrap());
+        assert_eq!(
+            fs::read_to_string(source.join("nested/file.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            fs::read_link(source.join("nested/link.txt")).unwrap(),
+            Path::new("file.txt")
+        );
+        assert_eq!(
+            fs::metadata(source.join("nested/file.txt")).unwrap().ino(),
+            fs::metadata(source.join("nested/hard.txt")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(source.join("nested/file.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            get_xattr(&source.join("nested/file.txt"), "user.rift_test"),
+            b"xattr"
+        );
+        assert!(progress.contains(&InitProgress::CreatingSubvolume));
+        assert!(progress.contains(&InitProgress::ImportingWorkspace));
+        assert!(progress.contains(&InitProgress::ActivatingWorkspace));
+        assert!(progress.contains(&InitProgress::RemovingOriginal));
+        assert!(
+            progress
+                .iter()
+                .any(|event| matches!(event, InitProgress::ImportedEntries { .. }))
+        );
+        remove_directory_linux(&source).unwrap();
+    }
+
+    #[test]
+    fn native_snapshot_and_delete_use_btrfs_strategy() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        let snapshot = temp.path().join("snapshot");
+        create_btrfs_subvolume(&source).unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
+
+        copy_directory_linux(&source, &snapshot).unwrap();
+        assert_eq!(
+            fs::read_to_string(snapshot.join("file.txt")).unwrap(),
+            "hello"
+        );
+        remove_directory_linux(&snapshot).unwrap();
+        remove_directory_linux(&source).unwrap();
+        assert!(!snapshot.exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn native_strategy_reports_non_btrfs_and_unsupported_entries() {
+        let temp = TempDir::new().unwrap();
+        assert!(!is_btrfs_filesystem(temp.path()).unwrap());
+        assert!(!is_btrfs_subvolume(temp.path()).unwrap());
+        assert!(matches!(
+            initialize_directory_linux(temp.path(), &mut |_| {}),
+            Err(Error::CowUnavailable(_))
+        ));
+        assert!(matches!(
+            copy_directory_linux(temp.path(), &temp.path().join("snapshot")),
+            Err(Error::CowUnavailable(_))
+        ));
+
+        let Some(btrfs) = btrfs_temp() else {
+            return;
+        };
+        let from = btrfs.path().join("source");
+        let to = btrfs.path().join("destination");
+        fs::create_dir(&from).unwrap();
+        fs::create_dir(&to).unwrap();
+        let fifo = from.join("fifo");
+        let fifo_name = c_path(&fifo).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            import_directory_linux(&from, &to, &mut |_| {}),
+            Err(Error::UnsupportedEntry(path)) if path == fifo
+        ));
+    }
+
+    #[test]
+    fn native_fallback_removes_populated_tree() {
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::create_dir(tree.join("nested")).unwrap();
+        fs::write(tree.join("nested/file.txt"), "hello").unwrap();
+        remove_emptyable_subvolume(&tree).unwrap();
+        assert!(!tree.exists());
     }
 }

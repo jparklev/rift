@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  btrfs-test:
+    name: Btrfs integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create btrfs workspace image
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes btrfs-progs
+          truncate -s 1G "$RUNNER_TEMP/rift-btrfs.img"
+          mkfs.btrfs -f "$RUNNER_TEMP/rift-btrfs.img"
+          sudo mkdir -p /mnt/rift-btrfs
+          sudo mount -o loop "$RUNNER_TEMP/rift-btrfs.img" /mnt/rift-btrfs
+          sudo chown "$USER:$USER" /mnt/rift-btrfs
+          cp -a "$GITHUB_WORKSPACE/." /mnt/rift-btrfs/rift
+
+      - name: Run tests on btrfs
+        working-directory: /mnt/rift-btrfs/rift
+        env:
+          RIFT_REQUIRE_BTRFS_TESTS: "1"
+        run: cargo test --package rift --locked
+
+  apfs-test:
+    name: APFS integration tests
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests on APFS
+        env:
+          RIFT_REQUIRE_APFS_TESTS: "1"
+        run: cargo test --package rift --locked

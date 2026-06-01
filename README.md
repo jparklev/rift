@@ -131,7 +131,7 @@ Creating from a rift records its immediate parent while storing workspaces side 
 ```bash
 rift remove                    # remove the current created rift
 rift remove -f ~/code/app      # unregister an initialized source root
-rift remove --all ~/code/app   # remove all descendants, preserve the root
+rift remove --children ~/code/app # remove descendants, preserve the root
 rift gc                        # physically delete removed workspaces and forget missing entries
 ```
 
