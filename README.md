@@ -1,8 +1,12 @@
-# Rift
+rift: better alternative to git worktrees
 
-Rift creates copy-on-write copies of workspace directories and records their ancestry.
+- copy on write (saves space)
+- instant (< 0.1s on 10gb folder)
+- fast cli
+- use as FFI lib with bun or node
 
-The command is `rift`. The npm package name is currently `rift-snapshot`.
+mac and linux+btrfs for now
+more support soon
 
 ## Install
 
@@ -16,11 +20,11 @@ Release archives are available from [GitHub Releases](https://github.com/anomaly
 
 ## Platforms
 
-| Platform          | Backend                  | Behavior |
-| ----------------- | ------------------------ | -------- |
+| Platform          | Backend                  | Behavior                                                           |
+| ----------------- | ------------------------ | ------------------------------------------------------------------ |
 | Linux x64         | Writable btrfs snapshots | `rift init` converts an ordinary directory into a btrfs subvolume. |
-| macOS arm64 / x64 | APFS `clonefile`         | `rift init` registers the source directory. |
-| Windows x64       | None                     | The package is published; workspace creation is not implemented. |
+| macOS arm64 / x64 | APFS `clonefile`         | `rift init` registers the source directory.                        |
+| Windows x64       | None                     | The package is published; workspace creation is not implemented.   |
 
 ## CLI
 
@@ -96,12 +100,12 @@ Default created-workspace storage is adjacent to the registered source root:
 The package selects a Bun or Node FFI binding through conditional exports.
 
 ```ts
-import { create, list, remove, gc } from "rift-snapshot"
+import { create, list, remove, gc } from "rift-snapshot";
 
-const workspace = create({ from: process.cwd(), name: "schema-work" })
-console.log(list({ of: process.cwd() }))
-remove({ at: workspace })
-gc()
+const workspace = create({ from: process.cwd(), name: "schema-work" });
+console.log(list({ of: process.cwd() }));
+remove({ at: workspace });
+gc();
 ```
 
 ### Node.js
