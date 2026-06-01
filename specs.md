@@ -75,6 +75,7 @@ remove(input: {
 `remove` logically deletes a created rift subtree by moving it into Rift-owned trash, or unregisters a registered source root while preserving its directory.
 
 - If `at` identifies a registered source root, preserve its directory, delete its `.rift` marker, move each existing registered descendant into trash, tolerate descendants already absent from disk, and delete its active registry tree.
+- The CLI requires `-f` or `--force` when `remove` would unregister a registered source root; this confirmation is not part of the core or FFI operation.
 - If `at` identifies a created rift, move its full descendant subtree into trash.
 - When `all` is true, preserve `at` and delete every managed descendant. In this mode `at` may be the registered source root.
 - Resolve all descendants through `parent_id` and move their directories deepest-first.

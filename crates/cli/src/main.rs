@@ -1,6 +1,21 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use rift::{Create, InitProgress, Manager};
 use std::path::PathBuf;
+use thiserror::Error;
+
+type Result<T> = std::result::Result<T, CliError>;
+
+#[derive(Debug, Error)]
+enum CliError {
+    #[error(transparent)]
+    Rift(#[from] rift::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(
+        "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
+    )]
+    ForceRequired,
+}
 
 #[derive(Parser)]
 #[command(name = "rift")]
@@ -41,6 +56,8 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         all: bool,
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     List {
         of: Option<PathBuf>,
@@ -53,31 +70,31 @@ enum Command {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("rift: {}", error_message(&error));
+        let message = match &error {
+            CliError::Rift(error) => error_message(error),
+            _ => error.to_string(),
+        };
+        eprintln!("{message}");
         std::process::exit(1);
     }
 }
 
 fn error_message(error: &rift::Error) -> String {
     match error {
-        rift::Error::InitializationRequired(path) => format!(
-            "workspace is not a btrfs subvolume: {}; run `rift init` in the root folder first",
-            path.display()
-        ),
-        rift::Error::WorkspaceNotInitialized(path) => format!(
-            "no .rift file found from: {}; run `rift init` in the root folder first",
-            path.display()
-        ),
-        rift::Error::MissingMarker(path) => format!(
-            "the .rift file is missing at: {}; run `rift init {}` to restore it",
-            path.display(),
-            path.display()
-        ),
+        rift::Error::InitializationRequired(_) => {
+            "this workspace must be initialized first; run `rift init` from its root folder".into()
+        }
+        rift::Error::WorkspaceNotInitialized(_) => {
+            "no initialized workspace found; run `rift init` from the root folder".into()
+        }
+        rift::Error::MissingMarker(_) => {
+            "this workspace is missing its `.rift` marker; run `rift init` to restore it".into()
+        }
         _ => error.to_string(),
     }
 }
 
-fn run() -> rift::Result<()> {
+fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Command::ShellInit { shell } = &cli.command {
         print_shell_init(*shell);
@@ -92,33 +109,30 @@ fn run() -> rift::Result<()> {
         Command::Init { at, here } => {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
-            eprintln!("using workspace at {}", at.display());
-            let mut imported_entries = 0;
-            let mut reported_entries = 0;
-            let converted = manager.init_with_progress(&at, |progress| {
-                if progress == InitProgress::CreatingSubvolume {
-                    eprintln!("first time init can be slow. creating new rifts will be instant");
-                }
-                match progress {
-                    InitProgress::ImportedEntries { entries } => {
-                        imported_entries = entries;
-                        if entries >= reported_entries + 1000 {
-                            eprintln!("imported {entries} entries");
-                            reported_entries = entries;
-                        }
+            let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
+            let mut initializing = existing.is_none() && missing_marker.is_none();
+            if initializing {
+                eprintln!("Initializing  {}\n", at.display());
+            }
+            let converted = manager.init_with_progress(&at, |progress| match progress {
+                InitProgress::CreatingSubvolume => {
+                    if !initializing {
+                        eprintln!("Initializing  {}\n", at.display());
+                        initializing = true;
                     }
-                    InitProgress::ActivatingWorkspace => {
-                        if imported_entries > reported_entries {
-                            eprintln!("imported {imported_entries} entries");
-                        }
-                        eprintln!("{}", init_progress_message(progress));
-                    }
-                    _ => eprintln!("{}", init_progress_message(progress)),
+                    eprintln!("First-time setup can take a moment.");
+                    eprintln!("New rifts will be instant.\n");
+                    eprintln!("Creating BTRFS subvolume...");
                 }
+                InitProgress::ImportingWorkspace => eprintln!("Importing workspace..."),
+                InitProgress::ImportedEntries { .. } => {}
+                InitProgress::ActivatingWorkspace
+                | InitProgress::RegisteringWorkspace
+                | InitProgress::RestoringMarker
+                | InitProgress::RemovingOriginal => {}
             })?;
             if converted {
-                let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
-                eprintln!("initialized btrfs subvolume at {}", at.display());
+                eprintln!("\nReady  {}", at.display());
                 if initialized_from_inside {
                     if cli.shell_cwd {
                         println!("{}", at.display());
@@ -130,12 +144,11 @@ fn run() -> rift::Result<()> {
                     }
                 }
             } else if let Some(root) = missing_marker {
-                eprintln!(
-                    "restored missing .rift file for initialized workspace at {}",
-                    root.display()
-                );
+                eprintln!("Restored marker  {}", root.display());
             } else if let Some(existing) = existing {
-                eprintln!("rift is already initialized at {}", existing.display());
+                eprintln!("Already initialized  {}", existing.display());
+            } else {
+                eprintln!("\nReady  {}", at.display());
             }
         }
         Command::Create { from, name, into } => {
@@ -149,7 +162,7 @@ fn run() -> rift::Result<()> {
             }
             println!("{}", destination.display());
         }
-        Command::Remove { at, all } => {
+        Command::Remove { at, all, force } => {
             let at = manager.workspace(at.unwrap_or(std::env::current_dir()?))?;
             let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
             if all {
@@ -167,6 +180,7 @@ fn run() -> rift::Result<()> {
             } else {
                 let ancestors = manager.ancestors(&at)?;
                 let unregistering_root = ancestors.is_empty();
+                require_force_for_root(unregistering_root, force)?;
                 let destination = if cli.shell_cwd && cwd.starts_with(&at) {
                     if unregistering_root {
                         Some(at.clone())
@@ -177,10 +191,11 @@ fn run() -> rift::Result<()> {
                     None
                 };
                 manager.remove(&at)?;
+                if unregistering_root {
+                    eprintln!("Unregistered  {}", at.display());
+                }
                 if cli.shell_cwd {
-                    if unregistering_root {
-                        eprintln!("unregistered {}", at.display());
-                    } else {
+                    if !unregistering_root {
                         eprintln!("removed {}", at.display());
                     }
                     if let Some(destination) = destination {
@@ -212,7 +227,7 @@ fn init_target(
     manager: &Manager,
     requested: &std::path::Path,
     here: bool,
-) -> rift::Result<(PathBuf, Option<PathBuf>, Option<PathBuf>)> {
+) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>)> {
     if here {
         return Ok((requested.to_path_buf(), None, None));
     }
@@ -220,7 +235,7 @@ fn init_target(
         Ok(root) => Ok((root.clone(), Some(root), None)),
         Err(rift::Error::MissingMarker(root)) => Ok((root.clone(), None, Some(root))),
         Err(rift::Error::WorkspaceNotInitialized(_)) => Ok((git_root(requested), None, None)),
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -231,16 +246,11 @@ fn git_root(path: &std::path::Path) -> PathBuf {
         .to_path_buf()
 }
 
-fn init_progress_message(progress: InitProgress) -> &'static str {
-    match progress {
-        InitProgress::CreatingSubvolume => "creating btrfs subvolume",
-        InitProgress::ImportingWorkspace => "importing existing workspace",
-        InitProgress::ImportedEntries { .. } => "importing existing workspace",
-        InitProgress::ActivatingWorkspace => "activating initialized workspace",
-        InitProgress::RemovingOriginal => "removing original directory after clean swap",
-        InitProgress::RestoringMarker => "restoring missing .rift file",
-        InitProgress::RegisteringWorkspace => "registering workspace",
+fn require_force_for_root(unregistering_root: bool, force: bool) -> Result<()> {
+    if unregistering_root && !force {
+        return Err(CliError::ForceRequired);
     }
+    Ok(())
 }
 
 fn print_shell_init(_shell: Shell) {
@@ -280,11 +290,11 @@ mod tests {
 
         assert_eq!(
             error_message(&rift::Error::WorkspaceNotInitialized(path.clone())),
-            "no .rift file found from: /tmp/app; run `rift init` in the root folder first"
+            "no initialized workspace found; run `rift init` from the root folder"
         );
         assert_eq!(
             error_message(&rift::Error::MissingMarker(path)),
-            "the .rift file is missing at: /tmp/app; run `rift init /tmp/app` to restore it"
+            "this workspace is missing its `.rift` marker; run `rift init` to restore it"
         );
     }
 
@@ -302,18 +312,16 @@ mod tests {
     }
 
     #[test]
-    fn init_progress_is_formatted_by_the_cli() {
+    fn root_unregistration_requires_force() {
+        assert!(matches!(
+            require_force_for_root(true, false),
+            Err(CliError::ForceRequired)
+        ));
+        assert!(require_force_for_root(true, true).is_ok());
+        assert!(require_force_for_root(false, false).is_ok());
         assert_eq!(
-            init_progress_message(InitProgress::ImportingWorkspace),
-            "importing existing workspace"
-        );
-        assert_eq!(
-            init_progress_message(InitProgress::RegisteringWorkspace),
-            "registering workspace"
-        );
-        assert_eq!(
-            init_progress_message(InitProgress::ImportedEntries { entries: 42 }),
-            "importing existing workspace"
+            CliError::ForceRequired.to_string(),
+            "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
         );
     }
 }

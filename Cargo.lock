@@ -521,6 +521,7 @@ dependencies = [
  "clap",
  "rift",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

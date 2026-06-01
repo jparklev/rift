@@ -69,9 +69,27 @@ rift remove                    # returns to its parent before removing the curre
 | macOS arm64 / x64 | APFS `clonefile`         | Supported                                            |
 | Windows x64       | Native package published | Copy-on-write backend not implemented yet            |
 
-Run `rift init` once to register a source workspace. On Linux, it also converts an ordinary btrfs directory into a subvolume with a clean swap at the same path; its native reflink importer reports entry progress because first time init can be slow, while creating new rifts will be instant. Run it from anywhere in a Git repository to initialize the nearest Git root; use `rift init --here` only when you intentionally want the current directory to be a separate Rift root.
+Run `rift init` once to register a source workspace. On Linux, it also converts an ordinary btrfs directory into a subvolume with a clean swap at the same path; its native reflink importer reports when import is in progress because first time init can be slow, while creating new rifts will be instant. Run it from anywhere in a Git repository to initialize the nearest Git root; use `rift init --here` only when you intentionally want the current directory to be a separate Rift root.
 
 ## CLI
+
+### Initialize a workspace
+
+On first-time Linux conversion, `rift init` reports the selected root and its progress:
+
+```text
+Initializing  ~/code/app
+
+First-time setup can take a moment.
+New rifts will be instant.
+
+Creating BTRFS subvolume...
+Importing workspace...
+
+Ready  ~/code/app
+```
+
+If the selected workspace is already registered, it prints one status line: `Already initialized  ~/code/app`.
 
 ### Create a workspace
 
@@ -111,12 +129,24 @@ Creating from a rift records its immediate parent while storing workspaces side 
 ### Remove and clean up
 
 ```bash
-rift remove                    # remove a rift, or unregister an initialized source root
+rift remove                    # remove the current created rift
+rift remove -f ~/code/app      # unregister an initialized source root
 rift remove --all ~/code/app   # remove all descendants, preserve the root
 rift gc                        # physically delete removed workspaces and forget missing entries
 ```
 
-`remove` is intentionally fast: it moves created rifts into adjacent `.trash/` storage and removes them from the active tree. When applied to an initialized source root, it unregisters the source: the source directory remains in place, its `.rift` marker is deleted, and existing registered descendants are moved into trash while missing descendants are forgotten. `gc` performs the potentially slow physical reclamation later and prunes registry entries for rifts deleted outside Rift when their full recorded subtree is gone. On standard btrfs mounts, reclamation may walk files when populated subvolume deletion is not permitted to the current user.
+`remove` is intentionally fast: it moves created rifts into adjacent `.trash/` storage and removes them from the active tree. In the CLI, unregistering an initialized source root requires `rift remove -f`; the source directory remains in place, its `.rift` marker is deleted, and existing registered descendants are moved into trash while missing descendants are forgotten. `gc` performs the potentially slow physical reclamation later and prunes registry entries for rifts deleted outside Rift when their full recorded subtree is gone. On standard btrfs mounts, reclamation may walk files when populated subvolume deletion is not permitted to the current user.
+
+Attempting to remove an initialized source root without confirmation prints:
+
+```text
+This is the root workspace.
+
+Unregistering it removes Rift metadata and trashes all child rifts.
+Run `rift remove -f` to continue.
+```
+
+After confirmation, Rift reports `Unregistered  ~/code/app`.
 
 ## JavaScript API
 

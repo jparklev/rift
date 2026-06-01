@@ -136,13 +136,28 @@ fn initialize_directory_linux(path: &Path, progress: &mut dyn FnMut(InitProgress
         progress(InitProgress::ImportingWorkspace);
         import_directory_linux(path, &staging, progress)?;
         progress(InitProgress::ActivatingWorkspace);
-        fs::rename(path, &original)?;
+        fs::rename(path, &original).map_err(|error| {
+            Error::CowUnavailable(format!(
+                "failed to move original workspace aside for activation: {error}"
+            ))
+        })?;
         if let Err(error) = fs::rename(&staging, path) {
-            let _ = fs::rename(&original, path);
-            return Err(error.into());
+            return match fs::rename(&original, path) {
+                Ok(()) => Err(Error::CowUnavailable(format!(
+                    "failed to activate initialized workspace; restored the original workspace: {error}"
+                ))),
+                Err(rollback) => Err(Error::CowUnavailable(format!(
+                    "failed to activate initialized workspace: {error}; also failed to restore the original workspace: {rollback}"
+                ))),
+            };
         }
+        copy_metadata_linux(&original, path, false)?;
         progress(InitProgress::RemovingOriginal);
-        fs::remove_dir_all(&original)?;
+        fs::remove_dir_all(&original).map_err(|error| {
+            Error::CowUnavailable(format!(
+                "initialized workspace is active but failed to remove the original directory: {error}"
+            ))
+        })?;
         Ok(true)
     })();
     if result.is_err() && staging.exists() {
@@ -201,7 +216,6 @@ fn import_directory_linux(
     for (source, destination) in directories.into_iter().rev() {
         copy_metadata_linux(&source, &destination, false)?;
     }
-    copy_metadata_linux(from, to, false)?;
     Ok(())
 }
 

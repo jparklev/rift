@@ -177,12 +177,9 @@ impl Manager {
             if read_marker(&at)?.is_none() {
                 progress(InitProgress::RestoringMarker);
                 write_marker(&at, &record.id)?;
-                if git {
-                    git::hide_marker(&at)?;
-                }
-                return Ok(false);
+            } else {
+                verify_marker(&record)?;
             }
-            verify_marker(&record)?;
             let converted = self.strategy.initialize_directory(&at, &mut progress)?;
             if git {
                 git::hide_marker(&at)?;
@@ -590,8 +587,10 @@ fn timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copy::{FailureStrategy, TestStrategy};
+    use crate::copy::{FailureStrategy, Strategy, TestStrategy};
+    use std::cell::Cell;
     use std::process::Command;
+    use std::rc::Rc;
     use tempfile::TempDir;
 
     fn manager(temp: &TempDir) -> Manager {
@@ -720,6 +719,47 @@ mod tests {
         manager.init(&source).unwrap();
         assert_eq!(fs::read_to_string(source.join(".rift")).unwrap(), id);
         assert!(manager.list(&nested).unwrap().is_empty());
+    }
+
+    struct InitializingStrategy {
+        initialized: Rc<Cell<bool>>,
+    }
+
+    impl Strategy for InitializingStrategy {
+        fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
+            unreachable!()
+        }
+
+        fn initialize_directory(
+            &self,
+            _path: &Path,
+            _progress: &mut dyn FnMut(InitProgress),
+        ) -> Result<bool> {
+            self.initialized.set(true);
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn init_continues_initialization_after_restoring_a_marker() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        let mut registered = manager(&temp);
+        registered.init(&source).unwrap();
+        fs::remove_file(source.join(".rift")).unwrap();
+        drop(registered);
+        let initialized = Rc::new(Cell::new(false));
+        let mut manager = Manager::with_strategy(
+            temp.path().join("registry.sqlite"),
+            Box::new(InitializingStrategy {
+                initialized: initialized.clone(),
+            }),
+        )
+        .unwrap();
+
+        assert!(manager.init(&source).unwrap());
+        assert!(initialized.get());
+        assert!(source.join(".rift").exists());
     }
 
     #[test]
