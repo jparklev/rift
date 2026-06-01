@@ -5,7 +5,7 @@ use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use strategy::Strategy;
+use strategy::{Strategy, StrategyInit};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -62,6 +62,19 @@ pub enum InitProgress {
     RemovingOriginal,
     RestoringMarker,
     RegisteringWorkspace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitOutcome {
+    Registered,
+    AlreadyInitialized,
+    Converted,
+}
+
+impl InitOutcome {
+    pub fn is_converted(self) -> bool {
+        matches!(self, Self::Converted)
+    }
 }
 
 #[derive(Clone)]
@@ -162,7 +175,7 @@ impl Manager {
         result
     }
 
-    pub fn init(&mut self, at: impl AsRef<Path>) -> Result<bool> {
+    pub fn init(&mut self, at: impl AsRef<Path>) -> Result<InitOutcome> {
         self.init_with_progress(at, |_| {})
     }
 
@@ -170,7 +183,7 @@ impl Manager {
         &mut self,
         at: impl AsRef<Path>,
         mut progress: impl FnMut(InitProgress),
-    ) -> Result<bool> {
+    ) -> Result<InitOutcome> {
         let at = existing_directory(at.as_ref())?;
         let git = git::check_source(&at)?;
         if let Some(record) = self.record_at_optional(&at)? {
@@ -184,7 +197,10 @@ impl Manager {
             if git.is_repository() {
                 git::hide_marker(&at)?;
             }
-            return Ok(converted);
+            return Ok(match converted {
+                StrategyInit::AlreadyNative => InitOutcome::AlreadyInitialized,
+                StrategyInit::Converted => InitOutcome::Converted,
+            });
         }
         if read_marker(&at)?.is_some() {
             return Err(Error::MarkerMismatch(at));
@@ -202,7 +218,10 @@ impl Manager {
                 "INSERT INTO rift (id, parent_id, path, created_at) VALUES (?1, NULL, ?2, ?3)",
                 params![id, path_text(&at)?, timestamp()],
             )?;
-            Ok(converted)
+            Ok(match converted {
+                StrategyInit::AlreadyNative => InitOutcome::Registered,
+                StrategyInit::Converted => InitOutcome::Converted,
+            })
         })();
         if result.is_err() {
             let _ = fs::remove_file(marker(&at));
@@ -642,10 +661,13 @@ mod tests {
         let source = source(&temp);
         let mut manager = manager(&temp);
 
-        assert!(!manager.init(&source).unwrap());
+        assert_eq!(manager.init(&source).unwrap(), InitOutcome::Registered);
         assert!(source.join(".rift").exists());
         assert!(manager.list(&source).unwrap().is_empty());
-        assert!(!manager.init(&source).unwrap());
+        assert_eq!(
+            manager.init(&source).unwrap(),
+            InitOutcome::AlreadyInitialized
+        );
     }
 
     #[test]
@@ -867,9 +889,9 @@ mod tests {
             &self,
             _path: &Path,
             _progress: &mut dyn FnMut(InitProgress),
-        ) -> Result<bool> {
+        ) -> Result<StrategyInit> {
             self.initialized.set(true);
-            Ok(true)
+            Ok(StrategyInit::Converted)
         }
     }
 
@@ -890,7 +912,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(manager.init(&source).unwrap());
+        assert_eq!(manager.init(&source).unwrap(), InitOutcome::Converted);
         assert!(initialized.get());
         assert!(source.join(".rift").exists());
     }

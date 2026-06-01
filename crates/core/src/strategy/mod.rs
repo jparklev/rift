@@ -16,14 +16,21 @@ pub(crate) trait Strategy {
         &self,
         _path: &Path,
         _progress: &mut dyn FnMut(InitProgress),
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<StrategyInit> {
+        Ok(StrategyInit::AlreadyNative)
     }
 
     fn remove_directory(&self, path: &Path) -> Result<()> {
         fs::remove_dir_all(path)?;
         Ok(())
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrategyInit {
+    AlreadyNative,
+    Converted,
 }
 
 pub(crate) fn default_strategy() -> Box<dyn Strategy> {

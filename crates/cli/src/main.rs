@@ -117,7 +117,7 @@ fn run() -> Result<()> {
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
             let mut converting = false;
-            let converted = manager.init_with_progress(&at, |progress| match progress {
+            let outcome = manager.init_with_progress(&at, |progress| match progress {
                 InitProgress::CreatingSubvolume => {
                     converting = true;
                     eprintln!("Initializing  {}\n", at.display());
@@ -132,7 +132,7 @@ fn run() -> Result<()> {
                 | InitProgress::RestoringMarker
                 | InitProgress::RemovingOriginal => {}
             })?;
-            if converted {
+            if outcome.is_converted() {
                 if converting {
                     eprintln!("\nReady  {}", at.display());
                 } else {

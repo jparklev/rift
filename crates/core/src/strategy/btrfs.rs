@@ -1,4 +1,4 @@
-use super::Strategy;
+use super::{Strategy, StrategyInit};
 use crate::{Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
@@ -15,7 +15,7 @@ impl Strategy for BtrfsStrategy {
         &self,
         path: &Path,
         progress: &mut dyn FnMut(InitProgress),
-    ) -> Result<bool> {
+    ) -> Result<StrategyInit> {
         initialize_directory_linux(path, progress)
     }
 
@@ -41,7 +41,7 @@ fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
 fn initialize_directory_linux(
     path: &Path,
     progress: &mut dyn FnMut(InitProgress),
-) -> Result<bool> {
+) -> Result<StrategyInit> {
     if !is_btrfs_filesystem(path)? {
         return Err(Error::CowUnavailable(format!(
             "{} is not on a btrfs filesystem",
@@ -49,7 +49,7 @@ fn initialize_directory_linux(
         )));
     }
     if is_btrfs_subvolume(path)? {
-        return Ok(false);
+        return Ok(StrategyInit::AlreadyNative);
     }
 
     let parent = path
@@ -88,7 +88,7 @@ fn initialize_directory_linux(
                 "initialized workspace is active but failed to remove the original directory: {error}"
             ))
         })?;
-        Ok(true)
+        Ok(StrategyInit::Converted)
     })();
     if result.is_err() && staging.exists() {
         let _ = remove_directory_linux(&staging);
@@ -526,7 +526,10 @@ mod linux_tests {
         std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
         let mut progress = Vec::new();
 
-        assert!(initialize_directory_linux(&source, &mut |event| progress.push(event)).unwrap());
+        assert_eq!(
+            initialize_directory_linux(&source, &mut |event| progress.push(event)).unwrap(),
+            StrategyInit::Converted
+        );
         assert!(is_btrfs_subvolume(&source).unwrap());
         assert_eq!(
             fs::read_to_string(source.join("nested/file.txt")).unwrap(),
