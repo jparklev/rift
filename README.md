@@ -1,3 +1,7 @@
+> **Warning: Experimental repository**
+>
+> This repository is experimental and is not ready for use. We are exploring a variety of ideas here, and behavior, interfaces, and implementation details may change without notice.
+
 rift: better alternative to git worktrees
 
 - copy on write (saves space)
