@@ -8,6 +8,12 @@ use std::path::Path;
 mod apfs;
 #[cfg(target_os = "linux")]
 mod btrfs;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod reflink;
+#[cfg(target_os = "linux")]
+mod xfs;
 
 pub(crate) trait Strategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()>;
@@ -35,7 +41,7 @@ pub(crate) enum StrategyInit {
 
 pub(crate) fn default_strategy() -> Box<dyn Strategy> {
     #[cfg(target_os = "linux")]
-    return Box::new(btrfs::BtrfsStrategy);
+    return Box::new(linux::LinuxStrategy);
 
     #[cfg(target_os = "macos")]
     return Box::new(apfs::ApfsStrategy);

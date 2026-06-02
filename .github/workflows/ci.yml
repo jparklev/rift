@@ -50,6 +50,33 @@ jobs:
           RIFT_REQUIRE_BTRFS_TESTS: "1"
         run: cargo test --package rift --locked
 
+  xfs-test:
+    name: XFS integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Create XFS workspace image
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes xfsprogs
+          truncate -s 1G "$RUNNER_TEMP/rift-xfs.img"
+          mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/rift-xfs.img"
+          sudo mkdir -p /mnt/rift-xfs
+          sudo mount -o loop "$RUNNER_TEMP/rift-xfs.img" /mnt/rift-xfs
+          sudo chown "$USER:$USER" /mnt/rift-xfs
+          cp -a "$GITHUB_WORKSPACE/." /mnt/rift-xfs/rift
+
+      - name: Run tests on XFS
+        working-directory: /mnt/rift-xfs/rift
+        env:
+          RIFT_REQUIRE_XFS_TESTS: "1"
+        run: cargo test --package rift --locked
+
   apfs-test:
     name: APFS integration tests
     runs-on: macos-14
