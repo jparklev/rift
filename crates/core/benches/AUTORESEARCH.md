@@ -29,10 +29,10 @@ cargo bench --bench compare -- /path/to/linux \
 - Name experimental sibling checkouts `rift-*`, such as `rift-git` or `rift-registry`.
 - Use one workload directory for every candidate in a comparison round.
 - Store output outside the workload directory and outside candidate checkouts.
-- On Linux, the workload must be on a supported btrfs filesystem for production snapshot behavior.
-- On macOS, results measure APFS `clonefile`, not btrfs behavior.
+- On Linux, the workload must be on supported btrfs or reflink-enabled XFS storage for production copy-on-write behavior.
+- On macOS, results measure APFS `clonefile`, not either Linux filesystem backend.
 
-The benchmark initializes the workload before timing. On the first run on Linux, initialization of an ordinary btrfs directory may convert it into a subvolume before any measured samples are taken. It leaves the workload initialized for later rounds.
+The benchmark initializes the workload before timing. On the first run on Linux, initialization of an ordinary btrfs directory may convert it into a subvolume before any measured samples are taken. XFS initialization verifies reflink support without conversion. It leaves the workload initialized for later rounds.
 
 ## Setup
 

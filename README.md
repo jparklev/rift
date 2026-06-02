@@ -9,7 +9,7 @@ rift: better alternative to git worktrees
 - fast cli
 - use as FFI lib with bun or node
 
-mac and linux+btrfs for now
+mac and linux with btrfs or reflink-enabled XFS for now
 more support soon
 
 ## Install
@@ -24,11 +24,12 @@ Release archives are available from [GitHub Releases](https://github.com/anomaly
 
 ## Platforms
 
-| Platform          | Backend                  | Behavior                                                           |
-| ----------------- | ------------------------ | ------------------------------------------------------------------ |
-| Linux x64         | Writable btrfs snapshots | `rift init` converts an ordinary directory into a btrfs subvolume. |
-| macOS arm64 / x64 | APFS `clonefile`         | `rift init` registers the source directory.                        |
-| Windows x64       | None                     | The package is published; workspace creation is not implemented.   |
+| Platform          | Backend                    | Behavior                                                           |
+| ----------------- | -------------------------- | ------------------------------------------------------------------ |
+| Linux x64         | Writable btrfs snapshots   | `rift init` converts an ordinary directory into a btrfs subvolume. |
+| Linux x64         | XFS per-file reflinks      | `rift init` verifies reflink support and registers the directory.  |
+| macOS arm64 / x64 | APFS `clonefile`           | `rift init` registers the source directory.                        |
+| Windows x64       | None                       | The package is published; workspace creation is not implemented.   |
 
 ## CLI
 
@@ -41,7 +42,7 @@ rift init
 
 `rift init` selects an existing Rift root above the current directory, or the nearest Git root when no Rift root exists. Use `--here` to initialize exactly the selected directory.
 
-On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required conversion.
+On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. On XFS, initialization verifies that the filesystem supports reflinks and registers the directory in place. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required setup.
 
 ### Create
 
@@ -53,7 +54,7 @@ rift create --into /fast/rifts
 
 `rift create` searches upward for `.rift`, copies that managed workspace, records the immediate parent, and prints the new workspace path to stdout.
 
-On Linux, it creates a writable btrfs snapshot. On macOS, it uses APFS `clonefile`.
+On btrfs, it creates a writable subvolume snapshot. On XFS, it reflink-clones the directory tree. On macOS, it uses APFS `clonefile`.
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
 
@@ -155,7 +156,7 @@ Benchmark a single real `rift create` operation against a directory:
 cargo bench --bench create -- /path/to/linux
 ```
 
-The benchmark initializes the supplied directory before timing, times only creation of the new rift, and then removes the created workspace outside the measured interval. On first use, initialization of an ordinary Linux btrfs directory converts it into a subvolume before measurement. The benchmark uses the production filesystem strategy, so results on macOS measure APFS cloning and results on Linux require and measure btrfs snapshots.
+The benchmark initializes the supplied directory before timing, times only creation of the new rift, and then removes the created workspace outside the measured interval. On first use, initialization of an ordinary Linux btrfs directory converts it into a subvolume before measurement. The benchmark uses the production filesystem strategy, so results measure APFS cloning on macOS, btrfs snapshots on btrfs, and per-file reflinks on XFS.
 
 Establish a baseline by measuring multiple independent rift creations and writing an aggregate machine-readable result file. Keep results outside the source workspace so they do not alter future measurements:
 
