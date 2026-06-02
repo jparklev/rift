@@ -27,7 +27,7 @@ pub enum Error {
     Path(String),
     #[error("copy-on-write cloning unavailable: {0}")]
     CowUnavailable(String),
-    #[error("workspace is not a btrfs subvolume: {0}")]
+    #[error("workspace requires initialization: {0}")]
     InitializationRequired(PathBuf),
     #[error("workspace is not initialized: {0}")]
     WorkspaceNotInitialized(PathBuf),
