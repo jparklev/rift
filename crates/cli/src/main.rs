@@ -32,6 +32,51 @@ struct Cli {
 enum Shell {
     Bash,
     Zsh,
+    Nushell,
+}
+
+impl Shell {
+    fn init_script(self, executable: &str) -> String {
+        match self {
+            Shell::Bash | Shell::Zsh => {
+                let executable = posix_shell_quote(executable);
+                format!(
+                    r#"rift() {{
+  case "${{1-}}" in
+    init|create|remove)
+      local __rift_cwd
+      __rift_cwd="$({executable} --shell-cwd "$@")" || return $?
+      if [ -n "$__rift_cwd" ]; then
+        builtin cd -- "$__rift_cwd" || return $?
+      fi
+      ;;
+    *)
+      {executable} "$@"
+      ;;
+  esac
+}}"#,
+                )
+            }
+            Shell::Nushell => {
+                let executable = nushell_shell_quote(executable);
+                format!(
+                    r#"def --env --wrapped rift [...rest] {{
+  match ($rest | get 0? | default "" | into string) {{
+    "init" | "create" | "remove" => {{
+      let cwd = (^{executable} --shell-cwd ...$rest | str trim)
+      if ($cwd | is-not-empty) {{
+        cd $cwd
+      }}
+    }}
+    _ => {{
+      ^{executable} ...$rest
+    }}
+  }}
+}}"#,
+                )
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -267,29 +312,21 @@ fn require_force_for_root(unregistering_root: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_shell_init(_shell: Shell) {
+fn print_shell_init(shell: Shell) {
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rift"));
-    let executable = shell_quote(&executable.to_string_lossy());
-    println!(
-        r#"rift() {{
-  case "${{1-}}" in
-    init|create|remove)
-      local __rift_cwd
-      __rift_cwd="$({executable} --shell-cwd "$@")" || return $?
-      if [ -n "$__rift_cwd" ]; then
-        builtin cd -- "$__rift_cwd" || return $?
-      fi
-      ;;
-    *)
-      {executable} "$@"
-      ;;
-  esac
-}}"#,
-    );
+    println!("{}", shell.init_script(&executable.to_string_lossy()));
 }
 
-fn shell_quote(value: &str) -> String {
+fn posix_shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn nushell_shell_quote(value: &str) -> String {
+    let mut hashes = String::from("#");
+    while value.contains(&format!("'{}", hashes)) {
+        hashes.push('#');
+    }
+    format!("r{}'{}'{}", hashes, value, hashes)
 }
 
 #[cfg(test)]
@@ -336,6 +373,55 @@ mod tests {
         assert_eq!(
             CliError::ForceRequired.to_string(),
             "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
+        );
+    }
+
+    #[test]
+    fn shell_init_renders_posix_wrapper_for_bash_and_zsh() {
+        let wrapper = r#"rift() {
+  case "${1-}" in
+    init|create|remove)
+      local __rift_cwd
+      __rift_cwd="$('/tmp/rift' --shell-cwd "$@")" || return $?
+      if [ -n "$__rift_cwd" ]; then
+        builtin cd -- "$__rift_cwd" || return $?
+      fi
+      ;;
+    *)
+      '/tmp/rift' "$@"
+      ;;
+  esac
+}"#;
+
+        assert_eq!(Shell::Bash.init_script("/tmp/rift"), wrapper);
+        assert_eq!(Shell::Zsh.init_script("/tmp/rift"), wrapper);
+    }
+
+    #[test]
+    fn shell_init_renders_nushell_wrapper() {
+        let wrapper = r#"def --env --wrapped rift [...rest] {
+  match ($rest | get 0? | default "" | into string) {
+    "init" | "create" | "remove" => {
+      let cwd = (^r#'/tmp/rift'# --shell-cwd ...$rest | str trim)
+      if ($cwd | is-not-empty) {
+        cd $cwd
+      }
+    }
+    _ => {
+      ^r#'/tmp/rift'# ...$rest
+    }
+  }
+}"#;
+
+        assert_eq!(Shell::Nushell.init_script("/tmp/rift"), wrapper);
+    }
+
+    #[test]
+    fn nushell_shell_quote_uses_enough_raw_string_hashes() {
+        assert_eq!(nushell_shell_quote("/tmp/rift"), "r#'/tmp/rift'#");
+        assert_eq!(
+            nushell_shell_quote("/tmp/it's'#rift"),
+            "r##'/tmp/it's'#rift'##"
         );
     }
 }
