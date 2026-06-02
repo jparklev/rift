@@ -63,14 +63,7 @@ impl Shell {
                     r#"def --env --wrapped rift [...rest] {{
   match ($rest | get 0? | default "" | into string) {{
     "init" | "create" | "remove" => {{
-      let result = (^{executable} --shell-cwd ...$rest | complete)
-      if ($result.stderr | is-not-empty) {{
-        print -e $result.stderr
-      }}
-      if $result.exit_code != 0 {{
-        error make {{msg: $"rift failed with exit code ($result.exit_code)"}}
-      }}
-      let cwd = ($result.stdout | str trim)
+      let cwd = (^{executable} --shell-cwd ...$rest | str trim)
       if ($cwd | is-not-empty) {{
         cd $cwd
       }}
@@ -409,14 +402,7 @@ mod tests {
         let wrapper = r#"def --env --wrapped rift [...rest] {
   match ($rest | get 0? | default "" | into string) {
     "init" | "create" | "remove" => {
-      let result = (^r#'/tmp/rift'# --shell-cwd ...$rest | complete)
-      if ($result.stderr | is-not-empty) {
-        print -e $result.stderr
-      }
-      if $result.exit_code != 0 {
-        error make {msg: $"rift failed with exit code ($result.exit_code)"}
-      }
-      let cwd = ($result.stdout | str trim)
+      let cwd = (^r#'/tmp/rift'# --shell-cwd ...$rest | str trim)
       if ($cwd | is-not-empty) {
         cd $cwd
       }
