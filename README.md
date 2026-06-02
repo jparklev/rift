@@ -85,6 +85,10 @@ Removing a source root requires `-f` in the CLI. The source directory remains on
 eval "$(rift shell-init zsh)" # or bash
 ```
 
+```nushell
+rift shell-init nushell | save -f (($nu.user-autoload-dirs | first) | path join "rift.nu")
+```
+
 The shell wrapper changes directory after `init` conversion, `create`, or removal of the current created rift.
 
 ## Storage
