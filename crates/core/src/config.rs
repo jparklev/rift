@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
 pub(crate) struct Config {
-    postclone: Vec<Postclone>,
+    postcreate: Vec<Postcreate>,
 }
 
 impl Config {
@@ -17,17 +17,17 @@ impl Config {
         parse(&path, &fs::read_to_string(&path)?)
     }
 
-    pub(crate) fn postclone(&self) -> &[Postclone] {
-        &self.postclone
+    pub(crate) fn postcreate(&self) -> &[Postcreate] {
+        &self.postcreate
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Postclone {
+pub(crate) struct Postcreate {
     run: String,
 }
 
-impl Postclone {
+impl Postcreate {
     pub(crate) fn run(&self) -> &str {
         &self.run
     }
@@ -45,12 +45,12 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawHooks {
     #[serde(default)]
-    postclone: Vec<RawPostclone>,
+    postcreate: Vec<RawPostcreate>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawPostclone {
+struct RawPostcreate {
     run: String,
 }
 
@@ -64,18 +64,18 @@ fn parse(path: &Path, contents: &str) -> Result<Config> {
         ));
     }
     raw.hooks
-        .postclone
+        .postcreate
         .into_iter()
         .map(|step| {
             let run = step.run.trim().to_owned();
             if run.is_empty() {
-                Err(invalid_config(path, "postclone run cannot be empty"))
+                Err(invalid_config(path, "postcreate run cannot be empty"))
             } else {
-                Ok(Postclone { run })
+                Ok(Postcreate { run })
             }
         })
         .collect::<Result<Vec<_>>>()
-        .map(|postclone| Config { postclone })
+        .map(|postcreate| Config { postcreate })
 }
 
 fn invalid_config(path: &Path, message: impl Into<String>) -> Error {
@@ -90,16 +90,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_ordered_postclone_steps() {
+    fn parses_ordered_postcreate_steps() {
         let config = parse(
             Path::new(".rift.toml"),
             r#"
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo one"
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo two"
 "#,
         )
@@ -107,9 +107,9 @@ run = "echo two"
 
         assert_eq!(
             config
-                .postclone()
+                .postcreate()
                 .iter()
-                .map(Postclone::run)
+                .map(Postcreate::run)
                 .collect::<Vec<_>>(),
             vec!["echo one", "echo two"]
         );
@@ -123,7 +123,7 @@ run = "echo two"
                 r#"
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = " "
 "#,
             ),
@@ -139,7 +139,7 @@ run = " "
                 r#"
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo ok"
 shell = "sh"
 "#,

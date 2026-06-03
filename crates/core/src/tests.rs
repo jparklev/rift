@@ -186,7 +186,7 @@ fn create_copy_all_preserves_regenerable_artifacts() {
 }
 
 #[test]
-fn create_runs_postclone_hooks_in_destination_order() {
+fn create_runs_postcreate_hooks_in_destination_order() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
     fs::write(
@@ -194,10 +194,10 @@ fn create_runs_postclone_hooks_in_destination_order() {
         r#"
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo first >> hook.log"
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo second >> hook.log"
 "#,
     )
@@ -212,7 +212,7 @@ run = "echo second >> hook.log"
 }
 
 #[test]
-fn postclone_failure_leaves_registered_workspace() {
+fn postcreate_failure_leaves_registered_workspace() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
     fs::write(
@@ -220,13 +220,13 @@ fn postclone_failure_leaves_registered_workspace() {
         r#"
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo before >> hook.log"
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "exit 7"
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "echo after >> hook.log"
 "#,
     )

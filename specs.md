@@ -46,7 +46,7 @@ Default behavior:
 - Copy the workspace while excluding known heavyweight regenerable dependency, build, and cache artifacts.
 - Preserve manifests, lockfiles, dirty files, staged files, untracked files, and ignored files that are not part of the built-in excluded artifact set.
 - `copyAll` opts into exact copying, including dependency and build artifacts.
-- `hooks` defaults to true and runs `.rift.toml` postclone hooks after copy, Git preparation, and registry insertion. `hooks: false` skips config loading and hook execution.
+- `hooks` defaults to true and runs `.rift.toml` postcreate hooks after workspace creation, Git preparation, and registry insertion. `hooks: false` skips config loading and hook execution.
 - Detach `HEAD` in the new workspace.
 - Return the path of the new workspace.
 
@@ -57,11 +57,11 @@ Default excluded artifacts are matched at any depth and include `node_modules`, 
 ```toml
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "pnpm install --frozen-lockfile"
 ```
 
-Postclone hooks run sequentially in the destination workspace with inherited stdio and environment plus `RIFT_SOURCE`, `RIFT_DESTINATION`, `RIFT_ID`, and `RIFT_PARENT_ID`. The first failing command stops later hooks. The created workspace remains registered and on disk, and the create operation reports a hook failure with the destination path.
+Postcreate hooks run sequentially in the destination workspace with inherited stdio and environment plus `RIFT_SOURCE`, `RIFT_DESTINATION`, `RIFT_ID`, and `RIFT_PARENT_ID`. The first failing command stops later hooks. The created workspace remains registered and on disk, and the create operation reports a hook failure with the destination path.
 
 On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On other reflink-capable Linux filesystems, clone the directory tree with native per-file reflinks.
 
