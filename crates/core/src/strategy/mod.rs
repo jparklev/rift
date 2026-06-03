@@ -12,8 +12,6 @@ mod btrfs;
 mod linux;
 #[cfg(target_os = "linux")]
 mod reflink;
-#[cfg(target_os = "linux")]
-mod xfs;
 
 pub(crate) trait Strategy {
     fn copy_directory(&self, from: &Path, to: &Path) -> Result<()>;

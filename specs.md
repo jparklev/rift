@@ -2,7 +2,7 @@
 
 ## Requirement
 
-`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. On Linux, managed workspaces use either btrfs subvolumes for instantaneous writable snapshots or reflink-enabled XFS directories for copy-on-write tree cloning.
+`rift` must be cross-platform as far as practical. Core semantics should work across macOS, Linux, and Windows. On Linux, managed workspaces use either btrfs subvolumes for instantaneous writable snapshots or native per-file reflinks for copy-on-write tree cloning.
 
 ## API
 
@@ -16,10 +16,10 @@ init(input: {
 
 `init` prepares and registers an original workspace for Rift.
 
-- On Linux, `at` must be on btrfs or reflink-enabled XFS; on other supported systems, initialization registers the workspace without filesystem conversion.
+- On Linux, `at` must be on btrfs or a filesystem with native reflink support; on other supported systems, initialization registers the workspace without filesystem conversion.
 - If `at` is already a btrfs subvolume, register it without replacing it.
 - If `at` is an ordinary btrfs directory, reflink-import it once into a staged btrfs subvolume and atomically replace the original directory at its existing path.
-- On XFS, verify reflink support and register `at` without replacing it.
+- On other Linux filesystems, verify native reflink support and register `at` without replacing it.
 - The original directory is retained under an internal temporary path only while it is needed for rollback and is removed before a successful `init` returns.
 - The core operation initializes exactly `at` and does not search parent directories.
 - The CLI defaults `at` to the current working directory; by default it selects the nearest existing managed ancestor or nearest Git root, prints the selected path, and then invokes core `init` with that exact path. `--here` opts into selecting exactly the supplied path.
@@ -45,7 +45,7 @@ Default behavior:
 - Detach `HEAD` in the new workspace.
 - Return the path of the new workspace.
 
-On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On XFS, clone the directory tree with native per-file reflinks.
+On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On other reflink-capable Linux filesystems, clone the directory tree with native per-file reflinks.
 
 If `from` is already managed by Rift, create copies that exact directory. Do not resolve back to an earlier workspace. Metadata should record the immediate source rift as its parent.
 
@@ -116,7 +116,7 @@ gc(): AbsolutePath[]
 
 - On btrfs, attempt immediate subvolume deletion first.
 - If standard mount permissions deny deletion of a populated subvolume, delete its contents and remove the now-empty subvolume with ordinary directory removal.
-- On XFS, recursively remove the reflinked directory tree.
+- On reflink-backed Linux filesystems, recursively remove the reflinked directory tree.
 - Delete each trash registry record after its filesystem directory is successfully removed.
 - Delete active registry records whose filesystem directories were removed outside Rift only when no existing recorded descendant would be orphaned, and include pruned missing paths in the result.
 
@@ -182,7 +182,7 @@ Copying is implemented behind a `Strategy` interface so platform-specific copy-o
 
 - The `BtrfsStrategy` production strategy on Linux uses writable btrfs subvolume snapshots.
 - The `BtrfsStrategy` performs a native per-file reflink import only when `init` converts an existing ordinary workspace into a subvolume; it does not spawn an external copy command and may report import progress. Its `create` never performs file-by-file cloning.
-- The `XfsStrategy` production strategy on Linux verifies reflink support during `init` and uses native per-file reflinks during `create` without spawning an external copy command.
+- The `LinuxReflinkStrategy` production strategy on Linux verifies native reflink support during `init` and uses native per-file reflinks during `create` without spawning an external copy command. XFS uses this path, as do other Linux filesystems when their `FICLONE` support succeeds.
 - The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning.
 - If no implemented copy-on-write strategy succeeds, `create` fails.
 - Full byte copying is not implemented as a fallback.
