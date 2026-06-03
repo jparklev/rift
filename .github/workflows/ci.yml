@@ -50,8 +50,8 @@ jobs:
           RIFT_REQUIRE_BTRFS_TESTS: "1"
         run: cargo test --package rift --locked
 
-  xfs-test:
-    name: XFS integration tests
+  linux-reflink-test:
+    name: Linux reflink integration tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -60,7 +60,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Create XFS workspace image
+      - name: Create reflink-capable XFS workspace image
         run: |
           sudo apt-get update
           sudo apt-get install --yes xfsprogs
@@ -71,10 +71,10 @@ jobs:
           sudo chown "$USER:$USER" /mnt/rift-xfs
           cp -a "$GITHUB_WORKSPACE/." /mnt/rift-xfs/rift
 
-      - name: Run tests on XFS
+      - name: Run tests on Linux reflinks
         working-directory: /mnt/rift-xfs/rift
         env:
-          RIFT_REQUIRE_XFS_TESTS: "1"
+          RIFT_REQUIRE_REFLINK_TESTS: "1"
         run: cargo test --package rift --locked
 
   apfs-test:
