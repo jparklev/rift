@@ -64,7 +64,7 @@ jobs:
       - name: Prepare filesystem and run tests
         run: |
           bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}" -- \
-            env ${{ matrix.required_env }}=1 cargo test --package rift --locked
+            env ${{ matrix.required_env }}=1 cargo test --package rift --package rift-cli --locked
 
   apfs-test:
     name: APFS integration tests

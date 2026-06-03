@@ -717,6 +717,7 @@ version = "0.0.9"
 dependencies = [
  "clap",
  "rift",
+ "rusqlite",
  "tempfile",
  "thiserror",
 ]
