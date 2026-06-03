@@ -266,9 +266,18 @@ assert_btrfs_subvolume_probe() {
   fi
 
   if ! output="$(btrfs subvolume delete "${probe}" 2>&1)"; then
-    fail "btrfs subvolume delete probe failed: ${output}"
+    case "${output}" in
+      *"Operation not permitted"* | *"Permission denied"*)
+        echo "btrfs subvolume delete probe cleanup needs fallback: ${output}"
+        rm -rf "${probe}"
+        ;;
+      *)
+        fail "btrfs subvolume delete probe failed: ${output}"
+        ;;
+    esac
   fi
 
+  [[ ! -e "${probe}" ]] || fail "btrfs subvolume probe cleanup left ${probe}"
   echo "btrfs subvolume probe passed"
 }
 
