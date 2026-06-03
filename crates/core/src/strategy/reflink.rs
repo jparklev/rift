@@ -292,6 +292,7 @@ pub(super) fn c_path(path: &Path) -> Result<std::ffi::CString> {
 mod tests {
     use super::*;
     use crate::strategy::linux::{Filesystem, LinuxStrategy, filesystem};
+    use crate::test_support::linux_extents::assert_shared_extents_when_reliable;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::{Builder, TempDir};
 
@@ -350,7 +351,9 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
         fs::create_dir(&nested).unwrap();
         let file = nested.join("file.txt");
+        let cow = nested.join("cow.txt");
         fs::write(&file, "hello").unwrap();
+        fs::write(&cow, "shared before mutation").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
         fs::hard_link(&file, nested.join("hard.txt")).unwrap();
         std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
@@ -387,6 +390,8 @@ mod tests {
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o750
         );
+        assert_shared_extents_when_reliable(&cow, &destination.join("nested/cow.txt"));
+        assert_copy_diverges_after_mutation(&cow, &destination.join("nested/cow.txt"));
         LinuxStrategy.remove_directory(&destination).unwrap();
         assert!(!destination.exists());
     }
@@ -423,5 +428,15 @@ mod tests {
             Err(Error::CowUnavailable(_))
         ));
         assert!(!destination.exists());
+    }
+
+    fn assert_copy_diverges_after_mutation(source: &Path, clone: &Path) {
+        let original = fs::read_to_string(source).unwrap();
+        assert_eq!(fs::read_to_string(clone).unwrap(), original);
+        fs::write(source, "parent mutation").unwrap();
+        assert_eq!(fs::read_to_string(clone).unwrap(), original);
+        fs::write(clone, "child mutation").unwrap();
+        assert_eq!(fs::read_to_string(source).unwrap(), "parent mutation");
+        assert_eq!(fs::read_to_string(clone).unwrap(), "child mutation");
     }
 }

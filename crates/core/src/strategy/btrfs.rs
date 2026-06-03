@@ -382,16 +382,26 @@ mod linux_tests {
         };
         let source = temp.path().join("source");
         let snapshot = temp.path().join("snapshot");
+        let filtered = temp.path().join("filtered");
         create_btrfs_subvolume(&source).unwrap();
-        fs::write(source.join("file.txt"), "hello").unwrap();
+        fs::write(source.join("file.txt"), "shared before mutation").unwrap();
 
         copy_directory_linux(&source, &snapshot, CopyMode::All).unwrap();
+        assert!(is_btrfs_subvolume(&snapshot).unwrap());
         assert_eq!(
             fs::read_to_string(snapshot.join("file.txt")).unwrap(),
-            "hello"
+            "shared before mutation"
         );
+        assert_copy_diverges_after_mutation(&source.join("file.txt"), &snapshot.join("file.txt"));
+
+        copy_directory_linux(&source, &filtered, CopyMode::Filtered).unwrap();
+        assert!(is_btrfs_subvolume(&filtered).unwrap());
+        assert_copy_diverges_after_mutation(&source.join("file.txt"), &filtered.join("file.txt"));
+
+        remove_directory_linux(&filtered).unwrap();
         remove_directory_linux(&snapshot).unwrap();
         remove_directory_linux(&source).unwrap();
+        assert!(!filtered.exists());
         assert!(!snapshot.exists());
         assert!(!source.exists());
     }
@@ -437,5 +447,15 @@ mod linux_tests {
         fs::write(tree.join("nested/file.txt"), "hello").unwrap();
         remove_emptyable_subvolume(&tree).unwrap();
         assert!(!tree.exists());
+    }
+
+    fn assert_copy_diverges_after_mutation(source: &Path, clone: &Path) {
+        let original = fs::read_to_string(source).unwrap();
+        assert_eq!(fs::read_to_string(clone).unwrap(), original);
+        fs::write(source, "parent mutation").unwrap();
+        assert_eq!(fs::read_to_string(clone).unwrap(), original);
+        fs::write(clone, "child mutation").unwrap();
+        assert_eq!(fs::read_to_string(source).unwrap(), "parent mutation");
+        assert_eq!(fs::read_to_string(clone).unwrap(), "child mutation");
     }
 }
