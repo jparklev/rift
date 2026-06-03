@@ -61,12 +61,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes ${{ matrix.packages }}
 
-      - name: Create filesystem workspace
-        run: bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}"
-
-      - name: Run tests on filesystem
-        working-directory: /mnt/rift-${{ matrix.filesystem }}/rift
-        run: ${{ matrix.required_env }}=1 cargo test --package rift --locked
+      - name: Prepare filesystem and run tests
+        run: |
+          bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}" -- \
+            env ${{ matrix.required_env }}=1 cargo test --package rift --locked
 
   apfs-test:
     name: APFS integration tests
