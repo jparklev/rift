@@ -62,19 +62,19 @@ On btrfs, exact copies use writable subvolume snapshots and filtered copies use 
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
 
-If the source contains `.rift.toml`, `rift create` runs configured postclone hooks after the workspace is copied, registered, and prepared. Use `--no-hooks` to skip them.
+If the source contains `.rift.toml`, `rift create` runs configured postcreate hooks after the workspace is created, registered, and prepared. Use `--no-hooks` to skip them.
 
 ```toml
 version = 1
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "pnpm install --frozen-lockfile"
 
-[[hooks.postclone]]
+[[hooks.postcreate]]
 run = "pnpm run codegen"
 ```
 
-Postclone commands run in the new workspace root. If a hook fails, the workspace remains registered and `rift create` exits with an error.
+Postcreate commands run in the new workspace root. If a hook fails, the workspace remains registered and `rift create` exits with an error.
 
 ### List And Ancestors
 

@@ -59,7 +59,7 @@ pub enum Error {
     InsideSource(PathBuf),
     #[error("invalid rift config at {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
-    #[error("postclone hook failed at {path}: `{command}` {message}")]
+    #[error("postcreate hook failed at {path}: `{command}` {message}")]
     HookFailed {
         path: PathBuf,
         command: String,
@@ -250,7 +250,7 @@ impl Manager {
             let _ = self.strategy.remove_directory(&destination);
         }
         result?;
-        hook::run_postclone(config.postclone(), &from, &destination, &id, &source.id)?;
+        hook::run_postcreate(config.postcreate(), &from, &destination, &id, &source.id)?;
         Ok(destination)
     }
 

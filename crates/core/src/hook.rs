@@ -1,11 +1,11 @@
-use crate::config::Postclone;
+use crate::config::Postcreate;
 use crate::id::RiftId;
 use crate::{Error, Result};
 use std::path::Path;
 use std::process::Command;
 
-pub(crate) fn run_postclone(
-    steps: &[Postclone],
+pub(crate) fn run_postcreate(
+    steps: &[Postcreate],
     source: &Path,
     destination: &Path,
     id: &RiftId,
@@ -13,7 +13,7 @@ pub(crate) fn run_postclone(
 ) -> Result<()> {
     steps
         .iter()
-        .map(Postclone::run)
+        .map(Postcreate::run)
         .try_for_each(|command| run_step(command, source, destination, id, parent_id))
 }
 
