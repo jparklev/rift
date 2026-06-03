@@ -23,9 +23,28 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
-  btrfs-test:
-    name: Btrfs integration tests
+  linux-filesystem-test:
+    name: Linux filesystem tests (${{ matrix.filesystem }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - filesystem: btrfs
+            packages: btrfs-progs
+            required_env: RIFT_REQUIRE_BTRFS_TESTS
+          - filesystem: xfs-reflink
+            packages: xfsprogs
+            required_env: RIFT_REQUIRE_REFLINK_TESTS
+          - filesystem: xfs-no-reflink
+            packages: xfsprogs
+            required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
+          - filesystem: ext4
+            packages: e2fsprogs
+            required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
+          - filesystem: tmpfs
+            packages: ""
+            required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -33,49 +52,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Create btrfs workspace image
+      - name: Install filesystem tools
+        if: matrix.packages != ''
         run: |
           sudo apt-get update
-          sudo apt-get install --yes btrfs-progs
-          truncate -s 1G "$RUNNER_TEMP/rift-btrfs.img"
-          mkfs.btrfs -f "$RUNNER_TEMP/rift-btrfs.img"
-          sudo mkdir -p /mnt/rift-btrfs
-          sudo mount -o loop "$RUNNER_TEMP/rift-btrfs.img" /mnt/rift-btrfs
-          sudo chown "$USER:$USER" /mnt/rift-btrfs
-          cp -a "$GITHUB_WORKSPACE/." /mnt/rift-btrfs/rift
+          sudo apt-get install --yes ${{ matrix.packages }}
 
-      - name: Run tests on btrfs
-        working-directory: /mnt/rift-btrfs/rift
-        env:
-          RIFT_REQUIRE_BTRFS_TESTS: "1"
-        run: cargo test --package rift --locked
+      - name: Create filesystem workspace
+        run: bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}"
 
-  linux-reflink-test:
-    name: Linux reflink integration tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Create reflink-capable XFS workspace image
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes xfsprogs
-          truncate -s 1G "$RUNNER_TEMP/rift-xfs.img"
-          mkfs.xfs -f -m reflink=1 "$RUNNER_TEMP/rift-xfs.img"
-          sudo mkdir -p /mnt/rift-xfs
-          sudo mount -o loop "$RUNNER_TEMP/rift-xfs.img" /mnt/rift-xfs
-          sudo chown "$USER:$USER" /mnt/rift-xfs
-          cp -a "$GITHUB_WORKSPACE/." /mnt/rift-xfs/rift
-
-      - name: Run tests on Linux reflinks
-        working-directory: /mnt/rift-xfs/rift
-        env:
-          RIFT_REQUIRE_REFLINK_TESTS: "1"
-        run: cargo test --package rift --locked
+      - name: Run tests on filesystem
+        working-directory: /mnt/rift-${{ matrix.filesystem }}/rift
+        run: ${{ matrix.required_env }}=1 cargo test --package rift --locked
 
   apfs-test:
     name: APFS integration tests

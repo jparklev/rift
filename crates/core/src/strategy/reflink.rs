@@ -272,7 +272,10 @@ mod tests {
     }
 
     fn non_reflink_temp() -> Option<TempDir> {
-        let temp = TempDir::new().unwrap();
+        let temp = Builder::new()
+            .prefix(".rift-core-test-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         (!matches!(filesystem(temp.path()).unwrap(), Filesystem::Btrfs)
             && verify_reflinks_linux(temp.path()).is_err())
         .then_some(temp)

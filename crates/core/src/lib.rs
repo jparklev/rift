@@ -5,6 +5,9 @@ mod name;
 mod registry;
 mod strategy;
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_filesystem_tests;
+
 use id::RiftId;
 use name::RiftName;
 use registry::{MovedRecord, PathRecord, Record, Registry, SubtreeScope};
