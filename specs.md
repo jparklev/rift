@@ -33,6 +33,8 @@ create(input: {
   from: AbsolutePath
   name?: string
   into?: AbsolutePath
+  copyAll?: boolean
+  hooks?: boolean
 }): AbsolutePath
 ```
 
@@ -41,9 +43,25 @@ Default behavior:
 - Source is `from`.
 - `name` defaults to a random adjective-noun directory name independent of the rift ULID.
 - `into` defaults to the managed rift directory.
-- Copy the whole workspace, including dirty, staged, untracked, and ignored files.
+- Copy the workspace while excluding known heavyweight regenerable dependency, build, and cache artifacts.
+- Preserve manifests, lockfiles, dirty files, staged files, untracked files, and ignored files that are not part of the built-in excluded artifact set.
+- `copyAll` opts into exact copying, including dependency and build artifacts.
+- `hooks` defaults to true and runs `.rift.toml` postclone hooks after copy, Git preparation, and registry insertion. `hooks: false` skips config loading and hook execution.
 - Detach `HEAD` in the new workspace.
 - Return the path of the new workspace.
+
+Default excluded artifacts are matched at any depth and include `node_modules`, `.pnpm-store`, `.yarn/cache`, `.yarn/unplugged`, `.yarn/install-state.gz`, `.yarn/build-state.yml`, `target`, `.venv`, `venv`, `.tox`, `.nox`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.vite`, `.parcel-cache`, `.cache`, `dist`, `build`, and `coverage`.
+
+`.rift.toml` supports one v1 hook shape:
+
+```toml
+version = 1
+
+[[hooks.postclone]]
+run = "pnpm install --frozen-lockfile"
+```
+
+Postclone hooks run sequentially in the destination workspace with inherited stdio and environment plus `RIFT_SOURCE`, `RIFT_DESTINATION`, `RIFT_ID`, and `RIFT_PARENT_ID`. The first failing command stops later hooks. The created workspace remains registered and on disk, and the create operation reports a hook failure with the destination path.
 
 On btrfs, `from` must already be a subvolume. If it is an ordinary directory, fail and instruct the user to run `rift init` first. On other reflink-capable Linux filesystems, clone the directory tree with native per-file reflinks.
 
@@ -163,7 +181,7 @@ Git support is an integration for directories that contain repositories; it does
 When registering or creating from a Git repository:
 
 - Add `/.rift` to `.git/info/exclude` so the identity marker does not appear in local Git status.
-- Copy the directory with its staged, unstaged, untracked, ignored, and cached state intact.
+- Preserve staged, unstaged, untracked, ignored, and cached state for copied paths.
 - If `HEAD` resolves to a commit, detach `HEAD` in the created destination at that same commit.
 - Preserve the copied index and working tree state while detaching.
 - If the repository has no commits yet, leave its unborn branch state unchanged because there is no commit to detach to.
@@ -181,9 +199,9 @@ The tool does not create branches, commit changes, or otherwise replace normal G
 Copying is implemented behind a `Strategy` interface so platform-specific copy-on-write backends can be added independently. Each strategy owns initialization, snapshot creation, and removal behavior for its filesystem.
 
 - The `BtrfsStrategy` production strategy on Linux uses writable btrfs subvolume snapshots.
-- The `BtrfsStrategy` performs a native per-file reflink import only when `init` converts an existing ordinary workspace into a subvolume; it does not spawn an external copy command and may report import progress. Its `create` never performs file-by-file cloning.
+- The `BtrfsStrategy` performs native per-file reflink imports when `init` converts an existing ordinary workspace into a subvolume and when filtered `create` materializes only included paths. Exact `create` uses writable btrfs snapshots.
 - The `LinuxReflinkStrategy` production strategy on Linux verifies native reflink support during `init` and uses native per-file reflinks during `create` without spawning an external copy command. XFS uses this path, as do other Linux filesystems when their `FICLONE` support succeeds.
-- The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning.
+- The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning for exact copies and per-entry cloning for filtered copies.
 - If no implemented copy-on-write strategy succeeds, `create` fails.
 - Full byte copying is not implemented as a fallback.
 - Future strategies may add Windows copy-on-write support without changing the API.

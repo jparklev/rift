@@ -1,17 +1,19 @@
 use super::linux::{Filesystem, filesystem};
 #[cfg(test)]
 use super::reflink::c_path;
-use super::reflink::{MetadataTarget, copy_metadata_linux, import_directory_linux};
+use super::reflink::{
+    MetadataTarget, copy_metadata_linux, import_directory_linux, import_directory_linux_filtered,
+};
 use super::{Strategy, StrategyInit};
-use crate::{Error, InitProgress, Result};
+use crate::{CopyMode, Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
 
 pub(super) struct BtrfsStrategy;
 
 impl Strategy for BtrfsStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
-        copy_directory_linux(from, to)
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+        copy_directory_linux(from, to, mode)
     }
 
     fn initialize_directory(
@@ -27,7 +29,7 @@ impl Strategy for BtrfsStrategy {
     }
 }
 
-fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
+fn copy_directory_linux(from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
     if !is_btrfs_filesystem(from)? {
         return Err(Error::CowUnavailable(format!(
             "Linux snapshot creation requires btrfs; {} is on another filesystem",
@@ -37,7 +39,17 @@ fn copy_directory_linux(from: &Path, to: &Path) -> Result<()> {
     if !is_btrfs_subvolume(from)? {
         return Err(Error::InitializationRequired(from.to_path_buf()));
     }
-    create_btrfs_snapshot(from, to)
+    match mode {
+        CopyMode::All => create_btrfs_snapshot(from, to),
+        CopyMode::Filtered => create_filtered_btrfs_subvolume(from, to),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_filtered_btrfs_subvolume(from: &Path, to: &Path) -> Result<()> {
+    create_btrfs_subvolume(to)?;
+    import_directory_linux_filtered(from, to, &mut |_| {})?;
+    copy_metadata_linux(from, to, MetadataTarget::FileOrDirectory)
 }
 
 #[cfg(target_os = "linux")]
@@ -373,7 +385,7 @@ mod linux_tests {
         create_btrfs_subvolume(&source).unwrap();
         fs::write(source.join("file.txt"), "hello").unwrap();
 
-        copy_directory_linux(&source, &snapshot).unwrap();
+        copy_directory_linux(&source, &snapshot, CopyMode::All).unwrap();
         assert_eq!(
             fs::read_to_string(snapshot.join("file.txt")).unwrap(),
             "hello"
@@ -394,7 +406,7 @@ mod linux_tests {
             Err(Error::CowUnavailable(_))
         ));
         assert!(matches!(
-            copy_directory_linux(temp.path(), &temp.path().join("snapshot")),
+            copy_directory_linux(temp.path(), &temp.path().join("snapshot"), CopyMode::All),
             Err(Error::CowUnavailable(_))
         ));
 

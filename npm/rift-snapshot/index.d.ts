@@ -10,6 +10,8 @@ export interface CreateOptions extends Options {
   from?: string
   name?: string
   into?: string
+  copyAll?: boolean
+  hooks?: boolean
 }
 
 export interface RemoveOptions extends AtOptions {
@@ -37,6 +39,8 @@ export type RiftErrorCode =
   | "already_exists"
   | "missing_rift"
   | "inside_source"
+  | "invalid_config"
+  | "hook_failed"
   | "invalid_request"
   | "panic"
   | "serialization"
