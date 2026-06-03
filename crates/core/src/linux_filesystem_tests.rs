@@ -95,6 +95,7 @@ fn production_unsupported_linux_filesystem_rejects_management() {
     assert!(!source.join(".rift").exists());
     assert!(!temp.path().join(".rifts").exists());
     assert_reflink_probe_cleaned_up(&source);
+    assert_registry_empty(&manager);
 
     assert!(matches!(
         manager.create(Create {
@@ -109,6 +110,40 @@ fn production_unsupported_linux_filesystem_rejects_management() {
         manager.list(&source),
         Err(Error::WorkspaceNotInitialized(_))
     ));
+    assert_registry_empty(&manager);
+}
+
+#[test]
+fn production_supported_linux_filesystem_cleans_partial_copy_failure() {
+    if !requires_supported_linux_filesystem_tests() {
+        return;
+    }
+    let temp = current_filesystem_temp();
+    let source = rich_git_workspace(temp.path());
+    let registry = temp.path().join("registry.sqlite");
+    let mut manager = Manager::open(&registry).unwrap();
+    manager.init(&source).unwrap();
+    assert_only_registered_path(&manager, &source);
+
+    let fifo = source.join("fifo");
+    make_fifo(&fifo);
+    let storage = temp.path().join(".rifts/source");
+    let expected = storage.join("unsupported-entry");
+
+    let error = manager
+        .create(Create {
+            from: source.clone(),
+            name: Some("unsupported-entry".into()),
+            into: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, Error::UnsupportedEntry(path) if path == fifo));
+    assert!(source.join(".rift").exists());
+    assert!(!expected.exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+    assert_only_registered_path(&manager, &source);
+    assert_reflink_probe_cleaned_up(&storage);
 }
 
 fn requires_supported_linux_filesystem_tests() -> bool {
@@ -239,6 +274,25 @@ fn assert_reflink_probe_cleaned_up(path: &Path) {
     );
 }
 
+fn assert_registry_empty(manager: &Manager) {
+    assert!(manager.registry.active_paths().unwrap().is_empty());
+    assert!(manager.registry.trashed_paths().unwrap().is_empty());
+}
+
+fn assert_only_registered_path(manager: &Manager, path: &Path) {
+    assert_eq!(
+        manager
+            .registry
+            .active_paths()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.path)
+            .collect::<Vec<_>>(),
+        vec![path.to_path_buf()]
+    );
+    assert!(manager.registry.trashed_paths().unwrap().is_empty());
+}
+
 fn assert_btrfs_subvolume_if_required(path: &Path) {
     if std::env::var_os("RIFT_REQUIRE_BTRFS_TESTS").is_some() {
         assert!(
@@ -268,6 +322,16 @@ fn assert_copy_diverges_after_mutation(source: &Path, child: &Path) {
 
 fn same_device(left: &Path, right: &Path) -> bool {
     fs::metadata(left).unwrap().dev() == fs::metadata(right).unwrap().dev()
+}
+
+fn make_fifo(path: &Path) {
+    let path = c_path(path);
+    assert_eq!(
+        // SAFETY: `path` is a valid C path and the mode is a standard FIFO
+        // permission bitmask for this test fixture.
+        unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+        0
+    );
 }
 
 fn git(path: &Path, args: &[&str]) {

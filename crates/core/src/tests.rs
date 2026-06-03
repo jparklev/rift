@@ -1,6 +1,8 @@
 use super::*;
 use crate::strategy::{FailureStrategy, Strategy, TestStrategy};
 use std::cell::Cell;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::rc::Rc;
 use tempfile::TempDir;
@@ -830,18 +832,175 @@ fn create_requires_an_initialized_workspace() {
 }
 
 #[test]
-fn unsafe_git_source_is_rejected_after_initialization() {
+fn unsafe_git_states_are_rejected_after_initialization() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
     run(&source, &["init"]);
     let mut manager = manager(&temp);
     manager.init(&source).unwrap();
-    fs::write(source.join(".git/MERGE_HEAD"), "commit").unwrap();
 
-    assert!(matches!(
-        manager.create(Create::new(source).named("unsafe")),
-        Err(Error::UnsafeGit(_))
-    ));
+    for state in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-merge",
+        "rebase-apply",
+        "index.lock",
+        "HEAD.lock",
+    ] {
+        let marker = source.join(".git").join(state);
+        if state.starts_with("rebase-") {
+            fs::create_dir(&marker).unwrap();
+        } else {
+            fs::write(&marker, "commit").unwrap();
+        }
+        let name = format!("unsafe-{state}");
+        let expected = child_path(&source, &name);
+
+        let error = manager
+            .create(Create::new(source.clone()).named(name))
+            .unwrap_err();
+
+        assert!(matches!(error, Error::UnsafeGit(message) if message.contains(state)));
+        assert!(!expected.exists());
+        assert!(manager.list(&source).unwrap().is_empty());
+        if marker.is_dir() {
+            fs::remove_dir(&marker).unwrap();
+        } else {
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+}
+
+#[test]
+fn linked_git_worktree_source_is_rejected_after_initialization() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    run(&source, &["init"]);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    fs::remove_dir_all(source.join(".git")).unwrap();
+    fs::write(source.join(".git"), "gitdir: ../linked/.git").unwrap();
+
+    let error = manager
+        .create(Create::new(source.clone()).named("linked-worktree"))
+        .unwrap_err();
+
+    assert!(matches!(error, Error::UnsafeGit(message) if message.contains("linked")));
+    assert!(!child_path(&source, "linked-worktree").exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+}
+
+struct PartialFailureStrategy;
+
+impl Strategy for PartialFailureStrategy {
+    fn copy_directory(&self, _from: &Path, to: &Path, _mode: CopyMode) -> Result<()> {
+        fs::create_dir(to)?;
+        fs::write(to.join("copied-before-failure.txt"), "partial")?;
+        fs::create_dir(to.join("nested"))?;
+        fs::write(to.join("nested/file.txt"), "partial")?;
+        Err(Error::CowUnavailable("partial failure".into()))
+    }
+}
+
+#[test]
+fn partial_copy_failure_removes_child_and_registry_row() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = Manager::with_strategy(
+        temp.path().join("registry.sqlite"),
+        Box::new(PartialFailureStrategy),
+    )
+    .unwrap();
+    manager.init(&source).unwrap();
+    let expected = child_path(&source, "partial");
+
+    let error = manager
+        .create(Create::new(source.clone()).named("partial"))
+        .unwrap_err();
+
+    assert!(matches!(error, Error::CowUnavailable(message) if message == "partial failure"));
+    assert!(source.join(".rift").exists());
+    assert!(!expected.exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_source_file_failure_removes_child_and_registry_row() {
+    if running_as_root() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let secret = source.join("secret.txt");
+    fs::write(&secret, "secret").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = manager.create(Create::new(source.clone()).named("unreadable-file"));
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = result.unwrap_err();
+
+    assert!(matches!(error, Error::Io(_)));
+    assert!(source.join(".rift").exists());
+    assert!(!child_path(&source, "unreadable-file").exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_source_directory_failure_removes_child_and_registry_row() {
+    if running_as_root() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let secret = source.join("secret");
+    fs::create_dir(&secret).unwrap();
+    fs::write(secret.join("file.txt"), "secret").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = manager.create(Create::new(source.clone()).named("unreadable-directory"));
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err();
+
+    assert!(matches!(error, Error::Walk(_) | Error::Io(_)));
+    assert!(source.join(".rift").exists());
+    assert!(!child_path(&source, "unreadable-directory").exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_destination_parent_failure_leaves_no_child_or_registry_row() {
+    if running_as_root() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let parent = temp.path().join("readonly");
+    fs::create_dir(&parent).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = manager.create(
+        Create::new(source.clone())
+            .named("blocked")
+            .with_storage(Some(parent.clone())),
+    );
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err();
+
+    assert!(matches!(error, Error::Io(_)));
+    assert!(source.join(".rift").exists());
+    assert!(!parent.join("blocked").exists());
+    assert!(manager.list(&source).unwrap().is_empty());
 }
 
 #[test]
@@ -861,6 +1020,12 @@ fn unavailable_cow_does_not_create_a_child() {
     ));
     assert!(source.join(".rift").exists());
     assert!(manager.list(&source).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and only reads the process identity.
+    unsafe { libc::geteuid() == 0 }
 }
 
 fn run(path: &Path, args: &[&str]) {
