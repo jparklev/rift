@@ -1,3 +1,4 @@
+use crate::test_support::linux_extents::{assert_shared_extents_when_reliable, is_btrfs_subvolume};
 use crate::{Create, Error, InitOutcome, Manager};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -24,6 +25,7 @@ fn production_supported_linux_filesystem_round_trip() {
         InitOutcome::AlreadyInitialized
     );
     assert!(source.join(".rift").exists());
+    assert_btrfs_subvolume_if_required(&source);
 
     let child = manager
         .create(Create {
@@ -32,6 +34,7 @@ fn production_supported_linux_filesystem_round_trip() {
             into: None,
         })
         .unwrap();
+    assert_btrfs_subvolume_if_required(&child);
     assert_rich_copy(&child);
     assert_detached_git_copy(&source, &child);
 
@@ -44,7 +47,13 @@ fn production_supported_linux_filesystem_round_trip() {
         })
         .unwrap();
     assert_eq!(custom, custom_parent.join("custom"));
+    assert_btrfs_subvolume_if_required(&custom);
     assert_rich_copy(&custom);
+    assert_native_cow_copy(
+        &source.join("nested/deeper/leaf.txt"),
+        &child.join("nested/deeper/leaf.txt"),
+    );
+    assert_native_cow_copy(&source.join("untracked.txt"), &custom.join("untracked.txt"));
 
     let grandchild = manager
         .create(Create {
@@ -228,6 +237,33 @@ fn assert_reflink_probe_cleaned_up(path: &Path) {
             .map(|entry| entry.unwrap().file_name())
             .all(|name| !name.to_string_lossy().starts_with(".rift-reflink-probe"))
     );
+}
+
+fn assert_btrfs_subvolume_if_required(path: &Path) {
+    if std::env::var_os("RIFT_REQUIRE_BTRFS_TESTS").is_some() {
+        assert!(
+            is_btrfs_subvolume(path).unwrap(),
+            "{} should be a btrfs subvolume",
+            path.display()
+        );
+    }
+}
+
+fn assert_native_cow_copy(source: &Path, child: &Path) {
+    if std::env::var_os("RIFT_REQUIRE_REFLINK_TESTS").is_some() {
+        assert_shared_extents_when_reliable(source, child);
+    }
+    assert_copy_diverges_after_mutation(source, child);
+}
+
+fn assert_copy_diverges_after_mutation(source: &Path, child: &Path) {
+    let original = fs::read_to_string(source).unwrap();
+    assert_eq!(fs::read_to_string(child).unwrap(), original);
+    fs::write(source, "parent mutation").unwrap();
+    assert_eq!(fs::read_to_string(child).unwrap(), original);
+    fs::write(child, "child mutation").unwrap();
+    assert_eq!(fs::read_to_string(source).unwrap(), "parent mutation");
+    assert_eq!(fs::read_to_string(child).unwrap(), "child mutation");
 }
 
 fn same_device(left: &Path, right: &Path) -> bool {
