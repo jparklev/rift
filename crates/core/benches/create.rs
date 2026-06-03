@@ -1,4 +1,4 @@
-use rift::{Create, Manager};
+use rift::{Create, CreateOptions, HookMode, Manager};
 use serde::Serialize;
 use std::env;
 use std::error::Error;
@@ -76,11 +76,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut samples_ms = Vec::with_capacity(samples);
     for sample in 1..=samples {
         let started = Instant::now();
-        let destination = manager.create(Create {
-            from: source.clone(),
-            name: Some(format!("benchmark-{process_id}-{run_id}-{sample}")),
-            into: None,
-        })?;
+        let destination = manager.create_with_options(
+            Create::new(source.clone()).named(format!("benchmark-{process_id}-{run_id}-{sample}")),
+            CreateOptions::default().hook_mode(HookMode::Skip),
+        )?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
         println!(

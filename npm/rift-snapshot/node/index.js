@@ -44,8 +44,8 @@ export function init({ at = process.cwd(), database } = {}) {
   return call({ command: "init", at, database })
 }
 
-export function create({ from = process.cwd(), name, into, database } = {}) {
-  return call({ command: "create", from, name, into, database })
+export function create({ from = process.cwd(), name, into, copyAll, hooks, database } = {}) {
+  return call({ command: "create", from, name, into, copyAll, hooks, database })
 }
 
 export function remove({ at = process.cwd(), all = false, database } = {}) {

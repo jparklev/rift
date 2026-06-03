@@ -1,4 +1,4 @@
-use rift::{Create, Error, Manager};
+use rift::{CopyMode, Create, CreateOptions, Error, HookMode, Manager};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
@@ -20,6 +20,9 @@ enum Command {
         from: PathBuf,
         name: Option<String>,
         into: Option<PathBuf>,
+        #[serde(rename = "copyAll")]
+        copy_all: Option<bool>,
+        hooks: Option<bool>,
     },
     Remove {
         at: PathBuf,
@@ -88,6 +91,8 @@ impl From<Error> for Failure {
             Error::AlreadyExists(path) => ("already_exists", Some(path.clone())),
             Error::MissingRift(path) => ("missing_rift", Some(path.clone())),
             Error::InsideSource(path) => ("inside_source", Some(path.clone())),
+            Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
+            Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
         };
         Self {
             code,
@@ -109,8 +114,27 @@ fn execute(input: &str) -> Result<Value, Failure> {
             .init(at)
             .map(|_| Value::Empty(()))
             .map_err(Failure::from),
-        Command::Create { from, name, into } => manager
-            .create(Create { from, name, into })
+        Command::Create {
+            from,
+            name,
+            into,
+            copy_all,
+            hooks,
+        } => manager
+            .create_with_options(
+                Create::new(from).with_name(name).with_storage(into),
+                CreateOptions::default()
+                    .copy_mode(if copy_all.unwrap_or(false) {
+                        CopyMode::All
+                    } else {
+                        CopyMode::Filtered
+                    })
+                    .hook_mode(if hooks.unwrap_or(true) {
+                        HookMode::Run
+                    } else {
+                        HookMode::Skip
+                    }),
+            )
             .map(|path| Value::Path(Some(path)))
             .map_err(Failure::from),
         Command::Remove { at, all } => {
@@ -220,6 +244,56 @@ mod tests {
             "workspace is not initialized: /tmp/app"
         );
         assert_eq!(response["error"]["path"], "/tmp/app");
+    }
+
+    #[test]
+    fn new_create_options_are_accepted_by_the_protocol() {
+        let request = serde_json::from_str::<Request>(
+            r#"{
+                "command": "create",
+                "from": "/tmp/app",
+                "name": "child",
+                "into": null,
+                "copyAll": true,
+                "hooks": false
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            request.command,
+            Command::Create {
+                copy_all: Some(true),
+                hooks: Some(false),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hook_and_config_errors_are_exposed_with_codes_and_paths() {
+        let config = serde_json::to_value(Response::Error {
+            error: Error::InvalidConfig {
+                path: PathBuf::from("/tmp/app/.rift.toml"),
+                message: "bad".into(),
+            }
+            .into(),
+        })
+        .unwrap();
+        let hook = serde_json::to_value(Response::Error {
+            error: Error::HookFailed {
+                path: PathBuf::from("/tmp/app"),
+                command: "exit 1".into(),
+                message: "exited with 1".into(),
+            }
+            .into(),
+        })
+        .unwrap();
+
+        assert_eq!(config["error"]["code"], "invalid_config");
+        assert_eq!(config["error"]["path"], "/tmp/app/.rift.toml");
+        assert_eq!(hook["error"]["code"], "hook_failed");
+        assert_eq!(hook["error"]["path"], "/tmp/app");
     }
 
     #[test]

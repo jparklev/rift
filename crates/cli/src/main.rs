@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rift::{Create, InitProgress, Manager};
+use rift::{CopyMode, Create, CreateOptions, HookMode, InitProgress, Manager};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -96,6 +96,10 @@ enum Command {
         name: Option<String>,
         #[arg(long)]
         into: Option<PathBuf>,
+        #[arg(long)]
+        copy_all: bool,
+        #[arg(long)]
+        no_hooks: bool,
     },
     Remove {
         at: Option<PathBuf>,
@@ -202,12 +206,29 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Create { from, name, into } => {
-            let destination = manager.create(Create {
-                from: from.unwrap_or(std::env::current_dir()?),
-                name,
-                into,
-            })?;
+        Command::Create {
+            from,
+            name,
+            into,
+            copy_all,
+            no_hooks,
+        } => {
+            let destination = manager.create_with_options(
+                Create::new(from.unwrap_or(std::env::current_dir()?))
+                    .with_name(name)
+                    .with_storage(into),
+                CreateOptions::default()
+                    .copy_mode(if copy_all {
+                        CopyMode::All
+                    } else {
+                        CopyMode::Filtered
+                    })
+                    .hook_mode(if no_hooks {
+                        HookMode::Skip
+                    } else {
+                        HookMode::Run
+                    }),
+            )?;
             if cli.shell_cwd {
                 eprintln!("created {}", destination.display());
             }
@@ -374,6 +395,28 @@ mod tests {
             CliError::ForceRequired.to_string(),
             "This is the root workspace.\n\nUnregistering it removes Rift metadata and trashes all child rifts.\nRun `rift remove -f` to continue."
         );
+    }
+
+    #[test]
+    fn create_command_accepts_copy_and_hook_flags() {
+        let cli = Cli::try_parse_from([
+            "rift",
+            "create",
+            "--name",
+            "child",
+            "--copy-all",
+            "--no-hooks",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                copy_all: true,
+                no_hooks: true,
+                ..
+            }
+        ));
     }
 
     #[test]

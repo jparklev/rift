@@ -50,13 +50,31 @@ On Linux, first initialization of an ordinary btrfs directory performs a reflink
 rift create
 rift create --name parser-fix
 rift create --into /fast/rifts
+rift create --copy-all
+rift create --no-hooks
 ```
 
 `rift create` searches upward for `.rift`, copies that managed workspace, records the immediate parent, and prints the new workspace path to stdout.
 
-On btrfs, it creates a writable subvolume snapshot. On other reflink-capable Linux filesystems, it reflink-clones the directory tree. On macOS, it uses APFS `clonefile`.
+By default, creation omits heavyweight regenerable dependency and build artifacts such as `node_modules`, `target`, virtualenvs, framework caches, `dist`, `build`, and `coverage`. Manifests and lockfiles are preserved. Use `--copy-all` to keep the previous exact-copy behavior.
+
+On btrfs, exact copies use writable subvolume snapshots and filtered copies use a reflink import into a new subvolume. On other reflink-capable Linux filesystems, Rift reflink-clones the selected directory tree. On macOS, exact copies use APFS `clonefile`, and filtered copies clone included entries.
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
+
+If the source contains `.rift.toml`, `rift create` runs configured postclone hooks after the workspace is copied, registered, and prepared. Use `--no-hooks` to skip them.
+
+```toml
+version = 1
+
+[[hooks.postclone]]
+run = "pnpm install --frozen-lockfile"
+
+[[hooks.postclone]]
+run = "pnpm run codegen"
+```
+
+Postclone commands run in the new workspace root. If a hook fails, the workspace remains registered and `rift create` exits with an error.
 
 ### List And Ancestors
 
@@ -131,7 +149,7 @@ With Node's permission model, also pass `--allow-ffi`.
 
 ```ts
 init(options?: { at?: string; database?: string }): null
-create(options?: { from?: string; name?: string; into?: string; database?: string }): string
+create(options?: { from?: string; name?: string; into?: string; copyAll?: boolean; hooks?: boolean; database?: string }): string
 remove(options?: { at?: string; all?: false; database?: string }): void
 remove(options: { at?: string; all: true; database?: string }): string[]
 list(options?: { of?: string; database?: string }): string[]

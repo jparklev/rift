@@ -1,6 +1,6 @@
+use crate::{CopyMode, InitProgress, Result};
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
-use crate::Error;
-use crate::{InitProgress, Result};
+use crate::{Error, filter::CopyFilter};
 use std::fs;
 use std::path::Path;
 
@@ -14,7 +14,7 @@ mod linux;
 mod reflink;
 
 pub(crate) trait Strategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()>;
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()>;
 
     fn initialize_directory(
         &self,
@@ -53,7 +53,7 @@ struct UnsupportedStrategy;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Strategy for UnsupportedStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
+    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
         Err(Error::CowUnavailable(
             "no copy-on-write strategy has been implemented for this platform".into(),
         ))
@@ -82,9 +82,21 @@ pub(crate) struct TestStrategy;
 
 #[cfg(test)]
 impl Strategy for TestStrategy {
-    fn copy_directory(&self, from: &Path, to: &Path) -> Result<()> {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
         fs::create_dir(to)?;
-        for entry in walkdir::WalkDir::new(from).min_depth(1).follow_links(false) {
+        let filter = CopyFilter;
+        for entry in walkdir::WalkDir::new(from)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                mode == CopyMode::All
+                    || entry
+                        .path()
+                        .strip_prefix(from)
+                        .map_or(true, |path| !filter.excludes(path))
+            })
+        {
             let entry = entry?;
             let destination = to.join(
                 entry
@@ -111,7 +123,7 @@ pub(crate) struct FailureStrategy;
 
 #[cfg(test)]
 impl Strategy for FailureStrategy {
-    fn copy_directory(&self, _from: &Path, _to: &Path) -> Result<()> {
+    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
         Err(Error::CowUnavailable("test failure".into()))
     }
 }
