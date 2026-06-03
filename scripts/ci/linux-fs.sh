@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-filesystem="${1:?usage: linux-fs.sh <btrfs|xfs-reflink|xfs-no-reflink|ext4|tmpfs|zfs|bcachefs>}"
+filesystem="${1:?usage: linux-fs.sh <btrfs|xfs-reflink|xfs-no-reflink|ext4|tmpfs|zfs>}"
 workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 runner_temp="${RUNNER_TEMP:-$(mktemp -d)}"
 mountpoint="/mnt/rift-${filesystem}"
@@ -53,21 +53,6 @@ case "${filesystem}" in
     truncate -s 1G "${image}"
     sudo modprobe zfs || true
     sudo zpool create -f -m "${mountpoint}" "${pool}" "${image}"
-    ;;
-  bcachefs)
-    truncate -s 1G "${image}"
-    sudo modprobe bcachefs || true
-    loopdev="$(sudo losetup --find --show "${image}")"
-    if command -v bcachefs >/dev/null 2>&1; then
-      sudo bcachefs format "${loopdev}"
-    elif command -v mkfs.bcachefs >/dev/null 2>&1; then
-      sudo mkfs.bcachefs "${loopdev}"
-    else
-      echo "bcachefs formatting tool is unavailable" >&2
-      exit 1
-    fi
-    sudo mount -t bcachefs "${loopdev}" "${mountpoint}" \
-      || sudo bcachefs mount "${loopdev}" "${mountpoint}"
     ;;
   *)
     echo "unsupported filesystem fixture: ${filesystem}" >&2

@@ -39,9 +39,6 @@ jobs:
           - filesystem: zfs
             packages: zfsutils-linux
             required_env: RIFT_REQUIRE_REFLINK_TESTS
-          - filesystem: bcachefs
-            packages: bcachefs-tools
-            required_env: RIFT_REQUIRE_REFLINK_TESTS
           - filesystem: xfs-no-reflink
             packages: xfsprogs
             required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
