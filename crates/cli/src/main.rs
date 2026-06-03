@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rift::{CopyMode, Create, HookMode, InitProgress, Manager};
+use rift::{CopyMode, Create, CreateOptions, HookMode, InitProgress, Manager};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -213,10 +213,11 @@ fn run() -> Result<()> {
             copy_all,
             no_hooks,
         } => {
-            let destination = manager.create(
+            let destination = manager.create_with_options(
                 Create::new(from.unwrap_or(std::env::current_dir()?))
                     .with_name(name)
-                    .with_storage(into)
+                    .with_storage(into),
+                CreateOptions::default()
                     .copy_mode(if copy_all {
                         CopyMode::All
                     } else {

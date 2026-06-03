@@ -25,14 +25,8 @@ fn create_input(from: PathBuf, name: &str) -> Create {
     Create::new(from).named(name)
 }
 
-fn create_input_with_modes(
-    from: PathBuf,
-    name: &str,
-    copy_mode: CopyMode,
-    hook_mode: HookMode,
-) -> Create {
-    Create::new(from)
-        .named(name)
+fn create_options(copy_mode: CopyMode, hook_mode: HookMode) -> CreateOptions {
+    CreateOptions::default()
         .copy_mode(copy_mode)
         .hook_mode(hook_mode)
 }
@@ -177,12 +171,10 @@ fn create_copy_all_preserves_regenerable_artifacts() {
     manager.init(&source).unwrap();
 
     let child = manager
-        .create(create_input_with_modes(
-            source.clone(),
-            "copy-all",
-            CopyMode::All,
-            HookMode::Run,
-        ))
+        .create_with_options(
+            create_input(source.clone(), "copy-all"),
+            create_options(CopyMode::All, HookMode::Run),
+        )
         .unwrap();
 
     assert_eq!(
@@ -265,12 +257,10 @@ fn hook_skip_ignores_invalid_config() {
     manager.init(&source).unwrap();
 
     let child = manager
-        .create(create_input_with_modes(
-            source,
-            "skip-hooks",
-            CopyMode::Filtered,
-            HookMode::Skip,
-        ))
+        .create_with_options(
+            create_input(source, "skip-hooks"),
+            create_options(CopyMode::Filtered, HookMode::Skip),
+        )
         .unwrap();
 
     assert!(child.join(".rift.toml").exists());

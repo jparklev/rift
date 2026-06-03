@@ -1,4 +1,4 @@
-use rift::{CopyMode, Create, Error, HookMode, Manager};
+use rift::{CopyMode, Create, CreateOptions, Error, HookMode, Manager};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
@@ -121,10 +121,9 @@ fn execute(input: &str) -> Result<Value, Failure> {
             copy_all,
             hooks,
         } => manager
-            .create(
-                Create::new(from)
-                    .with_name(name)
-                    .with_storage(into)
+            .create_with_options(
+                Create::new(from).with_name(name).with_storage(into),
+                CreateOptions::default()
                     .copy_mode(if copy_all.unwrap_or(false) {
                         CopyMode::All
                     } else {

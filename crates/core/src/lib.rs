@@ -66,8 +66,6 @@ pub struct Create {
     pub from: PathBuf,
     pub name: Option<String>,
     pub into: Option<PathBuf>,
-    pub copy_mode: CopyMode,
-    pub hook_mode: HookMode,
 }
 
 impl Create {
@@ -76,8 +74,6 @@ impl Create {
             from: from.into(),
             name: None,
             into: None,
-            copy_mode: CopyMode::default(),
-            hook_mode: HookMode::default(),
         }
     }
 
@@ -95,7 +91,15 @@ impl Create {
         self.into = into;
         self
     }
+}
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CreateOptions {
+    pub copy_mode: CopyMode,
+    pub hook_mode: HookMode,
+}
+
+impl CreateOptions {
     pub fn copy_mode(mut self, copy_mode: CopyMode) -> Self {
         self.copy_mode = copy_mode;
         self
@@ -179,6 +183,14 @@ impl Manager {
     }
 
     pub fn create(&mut self, input: Create) -> Result<PathBuf> {
+        self.create_with_options(input, CreateOptions::default())
+    }
+
+    pub fn create_with_options(
+        &mut self,
+        input: Create,
+        options: CreateOptions,
+    ) -> Result<PathBuf> {
         let requested = existing_directory(&input.from)?;
         let source = self.workspace_from(&requested)?;
         let from = source.path.clone();
@@ -202,14 +214,14 @@ impl Manager {
         if destination.exists() {
             return Err(Error::AlreadyExists(destination));
         }
-        let config = match input.hook_mode {
+        let config = match options.hook_mode {
             HookMode::Run => config::Config::load(&from)?,
             HookMode::Skip => config::Config::default(),
         };
 
         if let Err(error) = self
             .strategy
-            .copy_directory(&from, &destination, input.copy_mode)
+            .copy_directory(&from, &destination, options.copy_mode)
         {
             if destination.exists() {
                 let _ = self.strategy.remove_directory(&destination);
