@@ -87,10 +87,10 @@ fn supported_filesystem_cli_round_trip() {
         vec![custom.clone()]
     );
 
-    let removed = fixture.success(&source, ["gc"]).stdout_paths();
-    assert_eq!(removed.len(), 1);
-    assert!(removed[0].starts_with(fixture.root().join(".rifts/source/.trash")));
-    assert!(!removed[0].exists());
+    // Removal reclaims trash immediately, so gc has nothing left to do.
+    let trash = fixture.root().join(".rifts/source/.trash");
+    assert!(!trash.exists() || fs::read_dir(&trash).unwrap().next().is_none());
+    assert!(fixture.success(&source, ["gc"]).stdout_paths().is_empty());
     assert!(!fixture.default_database().exists());
 }
 

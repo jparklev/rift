@@ -62,6 +62,8 @@ bare workspace path, for programmatic callers that embed `rift create`.
 
 By default, creation omits heavyweight regenerable dependency and build artifacts such as `node_modules`, `target`, virtualenvs, framework caches, `dist`, `build`, and `coverage`. Manifests and lockfiles are preserved. When the source is a Git repository, files tracked by Git are always preserved even if their directory name matches a filtered artifact, so a filtered clone never drops version-controlled content. Use `--copy-all` to keep the previous exact-copy behavior.
 
+> Storage note: on a copy-on-write filesystem a clone shares its data blocks with the source, so cloning dependency directories costs almost no disk. If a postcreate hook reinstalls dependencies, the fresh install writes new, unshared blocks — in that workflow `--copy-all` with no reinstall is usually the cheaper option on disk. Filtering saves filesystem metadata and guarantees regenerable artifacts are rebuilt fresh.
+
 On btrfs, exact copies use writable subvolume snapshots and filtered copies use a reflink import into a new subvolume. On other reflink-capable Linux filesystems, Rift reflink-clones the selected directory tree. On macOS, exact copies use APFS `clonefile`, and filtered copies clone included entries.
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
@@ -102,13 +104,13 @@ rift status --json
 ### Remove And Garbage Collection
 
 ```bash
-rift remove                         # trash the current created rift subtree
+rift remove                         # remove the current created rift subtree
 rift remove -f ~/code/app           # unregister a source root
-rift remove --children ~/code/app   # trash descendants, preserve the selected workspace
-rift gc                             # physically delete trash and prune missing entries
+rift remove --children ~/code/app   # remove descendants, preserve the selected workspace
+rift gc                             # physically delete leftover trash and prune missing entries
 ```
 
-Removing a created rift moves its active subtree into adjacent `.trash` storage. `rift gc` deletes that storage later.
+Removing a created rift moves its active subtree into adjacent `.trash` storage and reclaims that storage immediately. If reclamation fails, the trash is kept and `rift gc` retries it.
 
 Removing a source root requires `-f` in the CLI. The source directory remains on disk. Its `.rift` marker is removed. Existing registered descendants are moved into trash. Missing descendants are removed from the registry.
 

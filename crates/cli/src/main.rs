@@ -314,6 +314,12 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            // Reclaim trashed rifts right away so removed workspaces stop
+            // holding storage. Removal already succeeded; a failed reclaim
+            // only warns, and `rift gc` remains the retry.
+            if let Err(error) = manager.gc() {
+                eprintln!("warning: could not reclaim trashed rifts: {error}; run `rift gc` to retry");
+            }
             Ok(())
         }
         Command::List { of } => {

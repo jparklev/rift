@@ -669,6 +669,9 @@ fn gc_removes_trashed_entries() {
     assert!(deleted.contains(&first_trash));
     assert_eq!(deleted.len(), 2);
     assert!(manager.list(&source).unwrap().is_empty());
+    // Emptied `.trash` containers are pruned along with their last entry.
+    assert!(!first_trash.parent().unwrap().exists());
+    assert!(!second_trash.parent().unwrap().exists());
 }
 
 #[test]

@@ -434,6 +434,16 @@ impl Manager {
                     self.strategy.remove_directory(&row.path)?;
                 }
                 self.registry.delete_trash(&row.id)?;
+                // Prune the `.trash` container once its last entry is gone;
+                // `remove_dir` refuses non-empty directories, so a racing
+                // trash insert keeps it in place.
+                if let Some(parent) = row
+                    .path
+                    .parent()
+                    .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new(".trash")))
+                {
+                    let _ = fs::remove_dir(parent);
+                }
                 Ok(row.path)
             })
             .collect::<Result<Vec<_>>>()?;
