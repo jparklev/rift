@@ -100,6 +100,13 @@ enum Command {
         copy_all: bool,
         #[arg(long)]
         no_hooks: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        of: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     Remove {
         at: Option<PathBuf>,
@@ -212,6 +219,7 @@ fn run() -> Result<()> {
             into,
             copy_all,
             no_hooks,
+            json,
         } => {
             let destination = manager.create_with_options(
                 Create::new(from.unwrap_or(std::env::current_dir()?))
@@ -229,10 +237,36 @@ fn run() -> Result<()> {
                         HookMode::Run
                     }),
             )?;
-            if cli.shell_cwd {
-                eprintln!("created {}", destination.display());
+            if json {
+                let rendered = workspace_json(&manager.describe(&destination)?);
+                if cli.shell_cwd {
+                    // The shell wrapper captures stdout to `cd` into the new
+                    // workspace; keep the bare path there and route JSON to stderr.
+                    eprintln!("{rendered}");
+                    println!("{}", destination.display());
+                } else {
+                    println!("{rendered}");
+                }
+            } else {
+                if cli.shell_cwd {
+                    eprintln!("created {}", destination.display());
+                }
+                println!("{}", destination.display());
             }
-            println!("{}", destination.display());
+            Ok(())
+        }
+        Command::Status { of, json } => {
+            let workspace = manager.describe(of.unwrap_or(std::env::current_dir()?))?;
+            if json {
+                println!("{}", workspace_json(&workspace));
+            } else {
+                println!("path    {}", workspace.path.display());
+                println!("id      {}", workspace.id);
+                match &workspace.parent {
+                    Some(parent) => println!("parent  {}", parent.display()),
+                    None => println!("parent  (root)"),
+                }
+            }
             Ok(())
         }
         Command::Remove {
@@ -333,6 +367,15 @@ fn require_force_for_root(unregistering_root: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn workspace_json(workspace: &rift::Workspace) -> String {
+    serde_json::json!({
+        "path": workspace.path.to_string_lossy(),
+        "id": workspace.id,
+        "parent": workspace.parent.as_ref().map(|parent| parent.to_string_lossy()),
+    })
+    .to_string()
+}
+
 fn print_shell_init(shell: Shell) {
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rift"));
     println!("{}", shell.init_script(&executable.to_string_lossy()));
@@ -417,6 +460,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn create_command_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["rift", "create", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Create { json: true, .. }));
+    }
+
+    #[test]
+    fn status_command_parses_path_and_json() {
+        let cli = Cli::try_parse_from(["rift", "status", "--json", "/tmp/app"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Status { json: true, of: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn workspace_json_renders_root_and_child() {
+        let root = workspace_json(&rift::Workspace {
+            path: PathBuf::from("/code/app"),
+            id: "ROOTID".into(),
+            parent: None,
+        });
+        assert_eq!(root, r#"{"id":"ROOTID","parent":null,"path":"/code/app"}"#);
+        let child = workspace_json(&rift::Workspace {
+            path: PathBuf::from("/code/.rifts/app/fix"),
+            id: "CHILDID".into(),
+            parent: Some(PathBuf::from("/code/app")),
+        });
+        assert_eq!(
+            child,
+            r#"{"id":"CHILDID","parent":"/code/app","path":"/code/.rifts/app/fix"}"#
+        );
     }
 
     #[test]

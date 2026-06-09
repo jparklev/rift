@@ -718,6 +718,7 @@ dependencies = [
  "clap",
  "rift",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

@@ -52,11 +52,15 @@ rift create --name parser-fix
 rift create --into /fast/rifts
 rift create --copy-all
 rift create --no-hooks
+rift create --json
 ```
+
+`--json` prints a machine-readable `{"path","id","parent"}` object instead of the
+bare workspace path, for programmatic callers that embed `rift create`.
 
 `rift create` searches upward for `.rift`, copies that managed workspace, records the immediate parent, and prints the new workspace path to stdout.
 
-By default, creation omits heavyweight regenerable dependency and build artifacts such as `node_modules`, `target`, virtualenvs, framework caches, `dist`, `build`, and `coverage`. Manifests and lockfiles are preserved. Use `--copy-all` to keep the previous exact-copy behavior.
+By default, creation omits heavyweight regenerable dependency and build artifacts such as `node_modules`, `target`, virtualenvs, framework caches, `dist`, `build`, and `coverage`. Manifests and lockfiles are preserved. When the source is a Git repository, files tracked by Git are always preserved even if their directory name matches a filtered artifact, so a filtered clone never drops version-controlled content. Use `--copy-all` to keep the previous exact-copy behavior.
 
 On btrfs, exact copies use writable subvolume snapshots and filtered copies use a reflink import into a new subvolume. On other reflink-capable Linux filesystems, Rift reflink-clones the selected directory tree. On macOS, exact copies use APFS `clonefile`, and filtered copies clone included entries.
 
@@ -84,6 +88,16 @@ rift ancestors
 ```
 
 `list` prints direct active child workspaces. `ancestors` prints parent workspaces, nearest first.
+
+### Status
+
+```bash
+rift status
+rift status /code/app
+rift status --json
+```
+
+`status` resolves the managed workspace governing a path and prints its root, identifier, and immediate parent workspace (the parent is `(root)` for a source root). Use `--json` for a `{"path","id","parent"}` object.
 
 ### Remove And Garbage Collection
 

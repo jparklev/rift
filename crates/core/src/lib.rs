@@ -73,6 +73,15 @@ pub struct Create {
     pub into: Option<PathBuf>,
 }
 
+/// A managed workspace resolved from a path: its root, identifier, and the
+/// immediate parent workspace it was created from (none for a source root).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Workspace {
+    pub path: PathBuf,
+    pub id: String,
+    pub parent: Option<PathBuf>,
+}
+
 impl Create {
     pub fn new(from: impl Into<PathBuf>) -> Self {
         Self {
@@ -453,6 +462,26 @@ impl Manager {
 
     pub fn workspace(&self, at: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(self.workspace_at(at)?.path)
+    }
+
+    /// Resolve the managed workspace governing `at`, reporting its root path,
+    /// identifier, and immediate parent workspace (none for a source root).
+    pub fn describe(&self, at: impl AsRef<Path>) -> Result<Workspace> {
+        let record = self.workspace_at(at)?;
+        let parent = match &record.parent_id {
+            Some(id) => Some(
+                self.registry
+                    .record_id(id)?
+                    .ok_or_else(|| Error::NotManaged(record.path.clone()))?
+                    .path,
+            ),
+            None => None,
+        };
+        Ok(Workspace {
+            id: record.id.as_str().to_owned(),
+            path: record.path,
+            parent,
+        })
     }
 
     fn workspace_at(&self, path: impl AsRef<Path>) -> Result<Record> {
