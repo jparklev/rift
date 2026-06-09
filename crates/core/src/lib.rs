@@ -55,6 +55,8 @@ pub enum Error {
     AlreadyExists(PathBuf),
     #[error("cannot remove subtree while a recorded rift path is missing: {0}")]
     MissingRift(PathBuf),
+    #[error("workspace {workspace} references parent record {parent_id}, which is missing from the registry")]
+    DanglingParent { workspace: PathBuf, parent_id: String },
     #[error("cannot copy a workspace into itself: {0}")]
     InsideSource(PathBuf),
     #[error("invalid rift config at {path}: {message}")]
@@ -472,7 +474,10 @@ impl Manager {
             Some(id) => Some(
                 self.registry
                     .record_id(id)?
-                    .ok_or_else(|| Error::NotManaged(record.path.clone()))?
+                    .ok_or_else(|| Error::DanglingParent {
+                        workspace: record.path.clone(),
+                        parent_id: id.to_string(),
+                    })?
                     .path,
             ),
             None => None,

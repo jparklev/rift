@@ -90,6 +90,9 @@ impl From<Error> for Failure {
             Error::UnknownMarker(path) => ("unknown_marker", Some(path.clone())),
             Error::AlreadyExists(path) => ("already_exists", Some(path.clone())),
             Error::MissingRift(path) => ("missing_rift", Some(path.clone())),
+            Error::DanglingParent { workspace, .. } => {
+                ("dangling_parent", Some(workspace.clone()))
+            }
             Error::InsideSource(path) => ("inside_source", Some(path.clone())),
             Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),

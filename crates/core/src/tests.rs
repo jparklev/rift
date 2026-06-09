@@ -1039,3 +1039,37 @@ fn run(path: &Path, args: &[&str]) {
             .success()
     );
 }
+
+#[test]
+fn describe_reports_root_child_and_dangling_parent() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+    let child = manager
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+
+    let root = manager.describe(&source).unwrap();
+    assert_eq!(root.path, source);
+    assert_eq!(root.parent, None);
+
+    let described = manager.describe(&child).unwrap();
+    assert_eq!(described.path, child);
+    assert_eq!(described.parent, Some(source.clone()));
+
+    // The registry's ON DELETE CASCADE means a dangling parent cannot arise
+    // through normal operations -- simulate external corruption by deleting the
+    // root row over a raw connection (foreign_keys defaults to OFF there). The
+    // error must name the real problem (a dangling parent reference), not
+    // claim the child itself is unmanaged.
+    let database = rusqlite::Connection::open(temp.path().join("registry.sqlite")).unwrap();
+    database.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    database
+        .execute("DELETE FROM rift WHERE parent_id IS NULL", [])
+        .unwrap();
+    drop(database);
+    let error = manager.describe(&child).unwrap_err();
+    assert!(matches!(error, Error::DanglingParent { .. }), "{error}");
+    assert!(error.to_string().contains("missing from the registry"));
+}
