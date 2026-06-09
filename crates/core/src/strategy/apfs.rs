@@ -1,8 +1,8 @@
 use super::Strategy;
 use crate::{CopyMode, Error, Result, filter::CopyFilter};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
-use walkdir::WalkDir;
+use std::path::{Path, PathBuf};
 
 pub(super) struct ApfsStrategy;
 
@@ -15,61 +15,97 @@ impl Strategy for ApfsStrategy {
     }
 }
 
+/// Filtered clones clone maximal clean subtrees with a single `clonefile`
+/// each, which preserves modes, timestamps, and xattrs in one syscall, and
+/// fall back to per-entry cloning only inside directories that contain an
+/// excluded path. Hard links are preserved between per-entry cloned files;
+/// links into a wholesale-cloned subtree become independent clones, matching
+/// `CopyMode::All` semantics (data blocks stay shared with the source).
 fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
-    use std::collections::HashMap;
+    let filter = CopyFilter::for_source(from);
+    let mut dirty = HashSet::new();
+    scan_directory_apfs(from, Path::new(""), &filter, &mut dirty)?;
+    fs::create_dir(to)?;
+    let mut hard_links = HashMap::new();
+    clone_children_apfs(from, to, Path::new(""), &dirty, &filter, &mut hard_links)?;
+    copy_metadata_apfs(from, to, MetadataTarget::FileOrDirectory)
+}
+
+/// Record in `dirty` every relative directory with an excluded descendant;
+/// such directories cannot be cloned wholesale. Excluded directories are not
+/// entered, so this readdir-only pass never descends into dropped artifacts.
+fn scan_directory_apfs(
+    root: &Path,
+    rel: &Path,
+    filter: &CopyFilter,
+    dirty: &mut HashSet<PathBuf>,
+) -> Result<bool> {
+    let mut is_dirty = false;
+    for entry in fs::read_dir(root.join(rel))? {
+        let entry = entry?;
+        let rel_child = rel.join(entry.file_name());
+        if filter.excludes(&rel_child) {
+            is_dirty = true;
+        } else if entry.file_type()?.is_dir()
+            && scan_directory_apfs(root, &rel_child, filter, dirty)?
+        {
+            is_dirty = true;
+        }
+    }
+    if is_dirty {
+        dirty.insert(rel.to_path_buf());
+    }
+    Ok(is_dirty)
+}
+
+fn clone_children_apfs(
+    from: &Path,
+    to: &Path,
+    rel: &Path,
+    dirty: &HashSet<PathBuf>,
+    filter: &CopyFilter,
+    hard_links: &mut HashMap<(u64, u64), PathBuf>,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let filter = CopyFilter::for_source(from);
-    let mut hard_links = HashMap::new();
-    let mut directories = Vec::new();
-    fs::create_dir(to)?;
-    for entry in WalkDir::new(from)
-        .min_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry
-                .path()
-                .strip_prefix(from)
-                .map_or(true, |path| !filter.excludes(path))
-        })
-    {
+    for entry in fs::read_dir(from.join(rel))? {
         let entry = entry?;
-        let source = entry.path();
-        let destination = to.join(
-            source
-                .strip_prefix(from)
-                .map_err(|error| Error::Path(error.to_string()))?,
-        );
-        let metadata = fs::symlink_metadata(source)?;
-        let file_type = metadata.file_type();
+        let rel_child = rel.join(entry.file_name());
+        if filter.excludes(&rel_child) {
+            continue;
+        }
+        let source = from.join(&rel_child);
+        let destination = to.join(&rel_child);
+        let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            fs::create_dir(&destination)?;
-            directories.push((source.to_path_buf(), destination));
+            if dirty.contains(&rel_child) {
+                fs::create_dir(&destination)?;
+                clone_children_apfs(from, to, &rel_child, dirty, filter, hard_links)?;
+                copy_metadata_apfs(&source, &destination, MetadataTarget::FileOrDirectory)?;
+            } else {
+                clone_path_apfs(&source, &destination)?;
+            }
         } else if file_type.is_file() {
+            let metadata = fs::symlink_metadata(&source)?;
             let key = (metadata.dev(), metadata.ino());
             if metadata.nlink() > 1 {
                 if let Some(existing) = hard_links.get(&key) {
                     fs::hard_link(existing, &destination)?;
                 } else {
-                    clone_path_apfs(source, &destination)?;
+                    clone_path_apfs(&source, &destination)?;
                     hard_links.insert(key, destination.clone());
                 }
             } else {
-                clone_path_apfs(source, &destination)?;
+                clone_path_apfs(&source, &destination)?;
             }
-            copy_metadata_apfs(source, &destination, MetadataTarget::FileOrDirectory)?;
+            copy_metadata_apfs(&source, &destination, MetadataTarget::FileOrDirectory)?;
         } else if file_type.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(source)?, &destination)?;
-            copy_metadata_apfs(source, &destination, MetadataTarget::Symlink)?;
+            std::os::unix::fs::symlink(fs::read_link(&source)?, &destination)?;
+            copy_metadata_apfs(&source, &destination, MetadataTarget::Symlink)?;
         } else {
-            return Err(Error::UnsupportedEntry(source.to_path_buf()));
+            return Err(Error::UnsupportedEntry(source));
         }
     }
-    for (source, destination) in directories.into_iter().rev() {
-        copy_metadata_apfs(&source, &destination, MetadataTarget::FileOrDirectory)?;
-    }
-    copy_metadata_apfs(from, to, MetadataTarget::FileOrDirectory)?;
     Ok(())
 }
 
@@ -345,6 +381,10 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
         fs::hard_link(&file, nested.join("hard.txt")).unwrap();
         std::os::unix::fs::symlink("file.txt", nested.join("link.txt")).unwrap();
+        // An exclusion inside `nested` keeps it on the per-entry path, which
+        // is the one that guarantees hard-link preservation.
+        fs::create_dir_all(nested.join("node_modules/pkg")).unwrap();
+        fs::write(nested.join("node_modules/pkg/index.js"), "dep").unwrap();
         fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
         fs::write(source.join("node_modules/pkg/index.js"), "module").unwrap();
 
@@ -353,6 +393,7 @@ mod tests {
             .unwrap();
 
         assert!(!destination.join("node_modules").exists());
+        assert!(!destination.join("nested/node_modules").exists());
         assert_eq!(
             fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
             "hello"
@@ -389,5 +430,52 @@ mod tests {
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn filtered_clone_of_clean_subtree_preserves_content_and_metadata() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let clean = source.join("clean/deep");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(&clean).unwrap();
+        fs::set_permissions(&clean, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = clean.join("file.txt");
+        fs::write(&file, "kept").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::hard_link(&file, clean.join("hard.txt")).unwrap();
+        std::os::unix::fs::symlink("file.txt", clean.join("link.txt")).unwrap();
+        // The root is dirty (an exclusion lives beside `clean`), but `clean`
+        // itself contains none, so it is cloned wholesale.
+        fs::create_dir(source.join("node_modules")).unwrap();
+        fs::write(source.join("node_modules/index.js"), "dep").unwrap();
+
+        ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .unwrap();
+
+        let cloned = destination.join("clean/deep");
+        assert!(!destination.join("node_modules").exists());
+        assert_eq!(fs::read_to_string(cloned.join("file.txt")).unwrap(), "kept");
+        assert_eq!(
+            fs::read_link(cloned.join("link.txt")).unwrap(),
+            Path::new("file.txt")
+        );
+        assert_eq!(
+            fs::metadata(cloned.join("file.txt")).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(&cloned).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Wholesale-cloned subtrees follow `clonefile` semantics: hard links
+        // become independent clones with identical content (blocks stay
+        // shared with the source until either copy is rewritten).
+        assert_eq!(fs::read_to_string(cloned.join("hard.txt")).unwrap(), "kept");
+        // Clones diverge from the source like any other rift.
+        fs::write(cloned.join("file.txt"), "rewritten").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "kept");
     }
 }
