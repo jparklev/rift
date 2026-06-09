@@ -67,7 +67,7 @@ pub(super) fn import_directory_linux_filtered(
     to: &Path,
     progress: &mut dyn FnMut(InitProgress),
 ) -> Result<()> {
-    import_directory_linux_with_filter(from, to, progress, Some(CopyFilter))
+    import_directory_linux_with_filter(from, to, progress, Some(CopyFilter::for_source(from)))
 }
 
 fn import_directory_linux_with_filter(
@@ -86,7 +86,7 @@ fn import_directory_linux_with_filter(
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            filter.map_or(true, |filter| {
+            filter.as_ref().map_or(true, |filter| {
                 entry
                     .path()
                     .strip_prefix(from)
@@ -188,8 +188,12 @@ pub(super) fn copy_metadata_linux(from: &Path, to: &Path, target: MetadataTarget
     if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    // A cloned file may be read-only (Git loose objects are 0444). Writing
+    // xattrs onto a read-only file fails with EACCES, so widen the mode while
+    // stamping metadata and apply the authoritative mode last. The transient
+    // widen carries only permission bits — never setuid/setgid/sticky.
     if matches!(target, MetadataTarget::FileOrDirectory) {
-        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
+        fs::set_permissions(to, fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200))?;
     }
     copy_xattrs_linux(from, to)?;
     let times = [
@@ -214,6 +218,9 @@ pub(super) fn copy_metadata_linux(from: &Path, to: &Path, target: MetadataTarget
     } != 0
     {
         return Err(std::io::Error::last_os_error().into());
+    }
+    if matches!(target, MetadataTarget::FileOrDirectory) {
+        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
     }
     Ok(())
 }

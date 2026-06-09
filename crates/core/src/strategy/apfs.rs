@@ -19,7 +19,7 @@ fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
     use std::collections::HashMap;
     use std::os::unix::fs::MetadataExt;
 
-    let filter = CopyFilter;
+    let filter = CopyFilter::for_source(from);
     let mut hard_links = HashMap::new();
     let mut directories = Vec::new();
     fs::create_dir(to)?;
@@ -110,8 +110,13 @@ fn copy_metadata_apfs(from: &Path, to: &Path, target: MetadataTarget) -> Result<
     if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    // `clonefile` preserves the source mode, which may be read-only (Git loose
+    // objects are 0444). Stamping xattrs and timestamps onto a read-only file
+    // fails with EACCES on macOS, so widen the mode while writing metadata and
+    // apply the authoritative (possibly read-only) mode last. The transient
+    // widen carries only permission bits — never setuid/setgid/sticky.
     if matches!(target, MetadataTarget::FileOrDirectory) {
-        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
+        fs::set_permissions(to, fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200))?;
     }
     copy_xattrs_apfs(from, to)?;
     let times = [
@@ -136,6 +141,9 @@ fn copy_metadata_apfs(from: &Path, to: &Path, target: MetadataTarget) -> Result<
     } != 0
     {
         return Err(std::io::Error::last_os_error().into());
+    }
+    if matches!(target, MetadataTarget::FileOrDirectory) {
+        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
     }
     Ok(())
 }
@@ -269,6 +277,57 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn filtered_clone_keeps_git_tracked_artifacts_but_drops_untracked_ones() {
+        use std::process::Command;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .arg("init")
+                .arg("--quiet")
+                .status()
+                .unwrap()
+                .success()
+        );
+        // A repo that *commits* its build output: `dist/` is normally filtered
+        // by name, but a clone that drops a tracked file would surface it as a
+        // spurious deletion in any later diff.
+        fs::create_dir(source.join("dist")).unwrap();
+        fs::write(source.join("dist/keep.txt"), "tracked build output").unwrap();
+        fs::write(source.join("dist/scratch.txt"), "untracked artifact").unwrap();
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "dep").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["add", "dist/keep.txt"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .unwrap();
+
+        // Tracked file survives even though its directory matches the filter.
+        assert_eq!(
+            fs::read_to_string(destination.join("dist/keep.txt")).unwrap(),
+            "tracked build output"
+        );
+        // Untracked artifacts inside the same directory are still dropped.
+        assert!(!destination.join("dist/scratch.txt").exists());
+        // A fully-untracked excluded directory is pruned entirely.
+        assert!(!destination.join("node_modules").exists());
     }
 
     #[test]
