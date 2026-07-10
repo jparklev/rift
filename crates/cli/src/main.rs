@@ -317,8 +317,10 @@ fn run() -> Result<()> {
             // Reclaim trashed rifts right away so removed workspaces stop
             // holding storage. Removal already succeeded; a failed reclaim
             // only warns, and `rift gc` remains the retry.
-            if let Err(error) = manager.gc() {
-                eprintln!("warning: could not reclaim trashed rifts: {error}; run `rift gc` to retry");
+            if let Err(error) = manager.reclaim_trash() {
+                eprintln!(
+                    "warning: could not reclaim trashed rifts: {error}; run `rift gc` to retry"
+                );
             }
             Ok(())
         }
@@ -479,7 +481,10 @@ mod tests {
         let cli = Cli::try_parse_from(["rift", "status", "--json", "/tmp/app"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Status { json: true, of: Some(_) }
+            Command::Status {
+                json: true,
+                of: Some(_)
+            }
         ));
     }
 

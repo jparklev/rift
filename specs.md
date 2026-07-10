@@ -136,7 +136,7 @@ gc(): AbsolutePath[]
 - If standard mount permissions deny deletion of a populated subvolume, delete its contents and remove the now-empty subvolume with ordinary directory removal.
 - On reflink-backed Linux filesystems, recursively remove the reflinked directory tree.
 - Delete each trash registry record after its filesystem directory is successfully removed.
-- Delete active registry records whose filesystem directories were removed outside Rift only when no existing recorded descendant would be orphaned, and include pruned missing paths in the result.
+- Never infer deletion of an active workspace from a transiently missing path. Administrative cleanup of externally deleted active paths, if added, must be an explicit separately named operation rather than garbage collection.
 
 ## Metadata
 

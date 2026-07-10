@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches:
+      - main
       - dev
   pull_request:
 
@@ -15,10 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --locked
@@ -50,7 +59,7 @@ jobs:
             required_env: RIFT_REQUIRE_UNSUPPORTED_LINUX_TESTS
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -68,15 +77,68 @@ jobs:
 
   apfs-test:
     name: APFS integration tests
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
 
       - name: Run tests on APFS
         env:
           RIFT_REQUIRE_APFS_TESTS: "1"
         run: cargo test --package rift --locked
+
+      - name: Build native package artifacts
+        run: cargo build --package rift-cli --package rift-ffi --release --locked
+
+      - name: Pack and install the macOS artifact
+        id: package
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/darwin-arm64" "target/release/rift" "target/release/librift_ffi.dylib"
+          output="$RUNNER_TEMP/rift-ci-npm-package"
+          consumer="$RUNNER_TEMP/rift-ci-npm-consumer"
+          mkdir -p "$output" "$consumer"
+          npm pack ./npm/rift-snapshot --json --pack-destination "$output" > "$output/pack.json"
+          filename="$(node -e 'const [entry] = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(entry.filename)' "$output/pack.json")"
+          npm install --prefix "$consumer" --ignore-scripts "$output/$filename"
+          cp scripts/test-packed-api.mjs scripts/test-packed-cli.mjs "$consumer/"
+          echo "consumer=$consumer" >> "$GITHUB_OUTPUT"
+
+      - name: Exercise packed Node FFI API
+        working-directory: ${{ steps.package.outputs.consumer }}
+        run: node --experimental-ffi ./test-packed-api.mjs
+
+      - name: Exercise packed Bun FFI API
+        working-directory: ${{ steps.package.outputs.consumer }}
+        run: bun ./test-packed-api.mjs
+
+      - name: Exercise packed CLI
+        working-directory: ${{ steps.package.outputs.consumer }}
+        run: node ./test-packed-cli.mjs
+
+  windows-core-test:
+    name: Windows core tests
+    runs-on: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked

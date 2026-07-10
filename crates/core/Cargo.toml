@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dirs.workspace = true
+fs2.workspace = true
 libc.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
@@ -16,7 +17,7 @@ ulid.workspace = true
 walkdir.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-git2 = { version = "0.20", default-features = false }
+git2 = { version = "0.21.0", default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true

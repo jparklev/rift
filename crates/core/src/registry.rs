@@ -15,11 +15,24 @@ pub(crate) struct PathRecord {
     pub(crate) path: PathBuf,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MovedRecord {
     pub(crate) id: RiftId,
     pub(crate) original_path: PathBuf,
     pub(crate) trash_path: PathBuf,
+}
+
+/// A removal whose filesystem moves may have happened without the final
+/// registry transfer. The journal is deliberately independent of `rift` rows:
+/// it must survive long enough to finish a root unregistration that ultimately
+/// deletes those rows by cascade.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingRemoval {
+    pub(crate) id: RiftId,
+    pub(crate) root_id: RiftId,
+    pub(crate) root_path: PathBuf,
+    pub(crate) unregister_root: bool,
+    pub(crate) moved: Vec<MovedRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +72,23 @@ impl Registry {
                 id TEXT PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 removed_at INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS removal_operation (
+                id TEXT PRIMARY KEY,
+                root_id TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                unregister_root INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS removal_operation_root_idx
+                ON removal_operation(root_id);
+              CREATE TABLE IF NOT EXISTS removal_move (
+                operation_id TEXT NOT NULL REFERENCES removal_operation(id) ON DELETE CASCADE,
+                rift_id TEXT NOT NULL,
+                original_path TEXT NOT NULL UNIQUE,
+                trash_path TEXT NOT NULL UNIQUE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (operation_id, rift_id)
               );",
         )?;
         Ok(Self { database })
@@ -138,12 +168,7 @@ impl Registry {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub(crate) fn delete_active(&self, id: &RiftId) -> Result<()> {
-        self.database
-            .execute("DELETE FROM rift WHERE id = ?1", [id.as_str()])?;
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(crate) fn trash_moved(&mut self, moved: &[MovedRecord]) -> Result<()> {
         let transaction = self.database.transaction()?;
         moved.iter().try_for_each(|record| -> Result<()> {
@@ -158,6 +183,198 @@ impl Registry {
             transaction.execute("DELETE FROM rift WHERE id = ?1", [record.id.as_str()])?;
             Ok(())
         })?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist the full removal intent before a directory is renamed. A later
+    /// manager open can then finish the move if this process exits between the
+    /// filesystem phase and the active-to-trash registry transfer.
+    pub(crate) fn stage_removal(
+        &mut self,
+        root: &Record,
+        unregister_root: bool,
+        moved: &[MovedRecord],
+    ) -> Result<PendingRemoval> {
+        let operation = PendingRemoval {
+            id: RiftId::new(),
+            root_id: root.id.clone(),
+            root_path: root.path.clone(),
+            unregister_root,
+            moved: moved.to_vec(),
+        };
+        let transaction = self.database.transaction()?;
+        transaction.execute(
+            "INSERT INTO removal_operation (id, root_id, root_path, unregister_root, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                operation.id.as_str(),
+                operation.root_id.as_str(),
+                path_text(&operation.root_path)?,
+                i64::from(operation.unregister_root),
+                timestamp(),
+            ],
+        )?;
+        operation
+            .moved
+            .iter()
+            .enumerate()
+            .try_for_each(|(position, record)| -> Result<()> {
+                transaction.execute(
+                    "INSERT INTO removal_move
+                     (operation_id, rift_id, original_path, trash_path, position)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        operation.id.as_str(),
+                        record.id.as_str(),
+                        path_text(&record.original_path)?,
+                        path_text(&record.trash_path)?,
+                        position as i64,
+                    ],
+                )?;
+                Ok(())
+            })?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
+    pub(crate) fn pending_removals(&self) -> Result<Vec<PendingRemoval>> {
+        let mut statement = self.database.prepare(
+            "SELECT id, root_id, root_path, unregister_root
+             FROM removal_operation ORDER BY created_at, id",
+        )?;
+        let operations = statement
+            .query_map([], |row| {
+                Ok((
+                    RiftId::from_stored(row.get(0)?),
+                    RiftId::from_stored(row.get(1)?),
+                    PathBuf::from(row.get::<_, String>(2)?),
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        operations
+            .into_iter()
+            .map(|(id, root_id, root_path, unregister_root)| {
+                self.load_pending_removal(id, root_id, root_path, unregister_root)
+            })
+            .collect()
+    }
+
+    pub(crate) fn pending_removals_for_root(
+        &self,
+        root_id: &RiftId,
+    ) -> Result<Vec<PendingRemoval>> {
+        let mut statement = self.database.prepare(
+            "SELECT id, root_id, root_path, unregister_root
+             FROM removal_operation WHERE root_id = ?1 ORDER BY created_at, id",
+        )?;
+        let operations = statement
+            .query_map([root_id.as_str()], |row| {
+                Ok((
+                    RiftId::from_stored(row.get(0)?),
+                    RiftId::from_stored(row.get(1)?),
+                    PathBuf::from(row.get::<_, String>(2)?),
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        operations
+            .into_iter()
+            .map(|(id, root_id, root_path, unregister_root)| {
+                self.load_pending_removal(id, root_id, root_path, unregister_root)
+            })
+            .collect()
+    }
+
+    pub(crate) fn pending_removal(&self, id: &RiftId) -> Result<Option<PendingRemoval>> {
+        let operation = self
+            .database
+            .query_row(
+                "SELECT id, root_id, root_path, unregister_root
+                 FROM removal_operation WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        RiftId::from_stored(row.get(0)?),
+                        RiftId::from_stored(row.get(1)?),
+                        PathBuf::from(row.get::<_, String>(2)?),
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        operation
+            .map(|(id, root_id, root_path, unregister_root)| {
+                self.load_pending_removal(id, root_id, root_path, unregister_root)
+            })
+            .transpose()
+    }
+
+    fn load_pending_removal(
+        &self,
+        id: RiftId,
+        root_id: RiftId,
+        root_path: PathBuf,
+        unregister_root: bool,
+    ) -> Result<PendingRemoval> {
+        let mut statement = self.database.prepare(
+            "SELECT rift_id, original_path, trash_path
+             FROM removal_move WHERE operation_id = ?1 ORDER BY position",
+        )?;
+        let moved = statement
+            .query_map([id.as_str()], |row| {
+                Ok(MovedRecord {
+                    id: RiftId::from_stored(row.get(0)?),
+                    original_path: PathBuf::from(row.get::<_, String>(1)?),
+                    trash_path: PathBuf::from(row.get::<_, String>(2)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(PendingRemoval {
+            id,
+            root_id,
+            root_path,
+            unregister_root,
+            moved,
+        })
+    }
+
+    /// Atomically promotes a fully moved operation into ordinary trash rows.
+    pub(crate) fn complete_removal(&mut self, operation: &PendingRemoval) -> Result<()> {
+        let transaction = self.database.transaction()?;
+        operation
+            .moved
+            .iter()
+            .try_for_each(|record| -> Result<()> {
+                transaction.execute(
+                    "INSERT INTO trash (id, path, removed_at) VALUES (?1, ?2, ?3)",
+                    params![
+                        record.id.as_str(),
+                        path_text(&record.trash_path)?,
+                        timestamp()
+                    ],
+                )?;
+                Ok(())
+            })?;
+        if operation.unregister_root {
+            transaction.execute(
+                "DELETE FROM rift WHERE id = ?1",
+                [operation.root_id.as_str()],
+            )?;
+        } else {
+            operation
+                .moved
+                .iter()
+                .try_for_each(|record| -> Result<()> {
+                    transaction.execute("DELETE FROM rift WHERE id = ?1", [record.id.as_str()])?;
+                    Ok(())
+                })?;
+        }
+        transaction.execute(
+            "DELETE FROM removal_operation WHERE id = ?1",
+            [operation.id.as_str()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -182,6 +399,7 @@ impl Registry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn active_paths(&self) -> Result<Vec<PathRecord>> {
         let mut statement = self.database.prepare("SELECT id, path FROM rift")?;
         Ok(statement
@@ -192,16 +410,6 @@ impl Registry {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    pub(crate) fn delete_active_records(&mut self, rows: &[PathRecord]) -> Result<()> {
-        let transaction = self.database.transaction()?;
-        rows.iter().try_for_each(|record| -> Result<()> {
-            transaction.execute("DELETE FROM rift WHERE id = ?1", [record.id.as_str()])?;
-            Ok(())
-        })?;
-        transaction.commit()?;
-        Ok(())
     }
 }
 
@@ -292,6 +500,7 @@ mod tests {
             registry.child_paths(&root_id).unwrap(),
             vec![child, sibling]
         );
+        assert_eq!(registry.active_paths().unwrap().len(), 4);
     }
 
     #[test]

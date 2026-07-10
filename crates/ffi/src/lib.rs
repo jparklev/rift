@@ -34,7 +34,27 @@ enum Command {
     Ancestors {
         of: PathBuf,
     },
+    Status {
+        of: PathBuf,
+    },
     Gc,
+}
+
+#[derive(Serialize)]
+struct Workspace {
+    path: PathBuf,
+    id: String,
+    parent: Option<PathBuf>,
+}
+
+impl From<rift::Workspace> for Workspace {
+    fn from(workspace: rift::Workspace) -> Self {
+        Self {
+            path: workspace.path,
+            id: workspace.id,
+            parent: workspace.parent,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -43,6 +63,7 @@ enum Value {
     Empty(()),
     Path(Option<PathBuf>),
     Paths(Vec<PathBuf>),
+    Workspace(Workspace),
 }
 
 #[derive(Serialize)]
@@ -83,6 +104,7 @@ impl From<Error> for Failure {
                 ("workspace_not_initialized", Some(path.clone()))
             }
             Error::MissingMarker(path) => ("missing_marker", Some(path.clone())),
+            Error::UnsafeMarker(path) => ("unsafe_marker", Some(path.clone())),
             Error::UnsupportedEntry(path) => ("unsupported_entry", Some(path.clone())),
             Error::UnsafeGit(_) => ("unsafe_git", None),
             Error::NotManaged(path) => ("not_managed", Some(path.clone())),
@@ -90,9 +112,7 @@ impl From<Error> for Failure {
             Error::UnknownMarker(path) => ("unknown_marker", Some(path.clone())),
             Error::AlreadyExists(path) => ("already_exists", Some(path.clone())),
             Error::MissingRift(path) => ("missing_rift", Some(path.clone())),
-            Error::DanglingParent { workspace, .. } => {
-                ("dangling_parent", Some(workspace.clone()))
-            }
+            Error::DanglingParent { workspace, .. } => ("dangling_parent", Some(workspace.clone())),
             Error::InsideSource(path) => ("inside_source", Some(path.clone())),
             Error::InvalidConfig { path, .. } => ("invalid_config", Some(path.clone())),
             Error::HookFailed { path, .. } => ("hook_failed", Some(path.clone())),
@@ -157,6 +177,11 @@ fn execute(input: &str) -> Result<Value, Failure> {
         Command::Ancestors { of } => manager
             .ancestors(of)
             .map(Value::Paths)
+            .map_err(Failure::from),
+        Command::Status { of } => manager
+            .describe(of)
+            .map(Workspace::from)
+            .map(Value::Workspace)
             .map_err(Failure::from),
         Command::Gc => manager.gc().map(Value::Paths).map_err(Failure::from),
     }
@@ -233,6 +258,21 @@ pub unsafe extern "C" fn rift_ffi_free(output: *mut c_char) {
 mod tests {
     use super::*;
 
+    fn ffi_json(request: serde_json::Value) -> serde_json::Value {
+        let input = CString::new(request.to_string()).unwrap();
+        // SAFETY: `input` is a valid, null-terminated request buffer for this call.
+        let output = unsafe { rift_ffi_call(input.as_ptr()) };
+        assert!(!output.is_null());
+        // SAFETY: `rift_ffi_call` returned a valid C string pointer, which remains
+        // allocated until `rift_ffi_free` is called below.
+        let response = unsafe { CStr::from_ptr(output).to_str().unwrap().to_owned() };
+        // SAFETY: `output` came from `rift_ffi_call` and is freed exactly once.
+        unsafe {
+            rift_ffi_free(output);
+        }
+        serde_json::from_str(&response).unwrap()
+    }
+
     #[test]
     fn core_errors_are_exposed_with_codes_and_data() {
         let response = Response::Error {
@@ -247,6 +287,24 @@ mod tests {
             "workspace is not initialized: /tmp/app"
         );
         assert_eq!(response["error"]["path"], "/tmp/app");
+
+        let unsafe_marker = serde_json::to_value(Response::Error {
+            error: Error::UnsafeMarker(PathBuf::from("/tmp/app/.rift")).into(),
+        })
+        .unwrap();
+        assert_eq!(unsafe_marker["error"]["code"], "unsafe_marker");
+        assert_eq!(unsafe_marker["error"]["path"], "/tmp/app/.rift");
+
+        let dangling_parent = serde_json::to_value(Response::Error {
+            error: Error::DanglingParent {
+                workspace: PathBuf::from("/tmp/app/.rifts/child"),
+                parent_id: "PARENTID".into(),
+            }
+            .into(),
+        })
+        .unwrap();
+        assert_eq!(dangling_parent["error"]["code"], "dangling_parent");
+        assert_eq!(dangling_parent["error"]["path"], "/tmp/app/.rifts/child");
     }
 
     #[test]
@@ -271,6 +329,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn status_describes_an_initialized_workspace_through_the_protocol() {
+        let fixture = std::env::temp_dir().join(format!(
+            "rift-ffi-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = fixture.join("app");
+        let database = fixture.join("rift.db");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let init = serde_json::json!({
+            "database": database,
+            "command": "init",
+            "at": workspace,
+        });
+        let init = ffi_json(init);
+        assert_eq!(init["status"], "ok");
+        assert_eq!(init["value"], serde_json::Value::Null);
+
+        let status = serde_json::json!({
+            "database": database,
+            "command": "status",
+            "of": workspace,
+        });
+        let response = ffi_json(status);
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            response["value"]["path"],
+            std::fs::canonicalize(&workspace)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(
+            response["value"]["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(response["value"]["parent"], serde_json::Value::Null);
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

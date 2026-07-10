@@ -8,12 +8,16 @@ if (!platform || !arch) throw new Error(`Unsupported Rift platform: ${os.platfor
 let libraryPath
 if (platform === "linux" && arch === "x64") {
   libraryPath = (await import("../prebuilds/linux-x64/librift_ffi.so", { with: { type: "file" } })).default
+} else if (platform === "linux" && arch === "arm64") {
+  libraryPath = (await import("../prebuilds/linux-arm64/librift_ffi.so", { with: { type: "file" } })).default
 } else if (platform === "darwin" && arch === "x64") {
   libraryPath = (await import("../prebuilds/darwin-x64/librift_ffi.dylib", { with: { type: "file" } })).default
 } else if (platform === "darwin" && arch === "arm64") {
   libraryPath = (await import("../prebuilds/darwin-arm64/librift_ffi.dylib", { with: { type: "file" } })).default
 } else if (platform === "windows" && arch === "x64") {
   libraryPath = (await import("../prebuilds/windows-x64/rift_ffi.dll", { with: { type: "file" } })).default
+} else if (platform === "windows" && arch === "arm64") {
+  libraryPath = (await import("../prebuilds/windows-arm64/rift_ffi.dll", { with: { type: "file" } })).default
 } else {
   throw new Error(`Unsupported Rift platform: ${platform}-${arch}`)
 }
@@ -66,6 +70,10 @@ export function list({ of = process.cwd(), database } = {}) {
 
 export function ancestors({ of = process.cwd(), database } = {}) {
   return call({ command: "ancestors", of, database })
+}
+
+export function status({ of = process.cwd(), database } = {}) {
+  return call({ command: "status", of, database })
 }
 
 export function gc({ database } = {}) {

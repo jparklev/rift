@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Decides which entries a filtered clone omits.
 ///
@@ -15,11 +16,30 @@ use std::path::{Component, Path, PathBuf};
 /// inside a nested submodule (whose contents live in that submodule's own index)
 /// are not inspected; a submodule that commits files under an artifact-named
 /// directory is governed by the name filter alone.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CopyFilter {
-    /// Tracked paths relative to the source root, case-folded when `ignore_case`.
-    tracked: BTreeSet<PathBuf>,
+    /// The Git index is expensive to open and walk. Most clean workspaces do
+    /// not contain a potentially filtered path at all, so defer it until a
+    /// name-based exclusion actually needs a tracked-file exception.
+    source: Option<PathBuf>,
+    tracked: OnceLock<TrackedPaths>,
+}
+
+#[derive(Debug)]
+struct TrackedPaths {
+    /// Tracked paths relative to the source root, case-folded when
+    /// `ignore_case`.
+    paths: BTreeSet<PathBuf>,
     ignore_case: bool,
+}
+
+impl Default for CopyFilter {
+    fn default() -> Self {
+        Self {
+            source: None,
+            tracked: OnceLock::new(),
+        }
+    }
 }
 
 impl CopyFilter {
@@ -31,17 +51,34 @@ impl CopyFilter {
 
     /// A filter that protects every Git-tracked path under `source`.
     pub(crate) fn for_source(source: &Path) -> Self {
-        let (paths, ignore_case) = tracked_paths(source);
-        Self::from_tracked(paths, ignore_case)
+        Self {
+            source: Some(source.to_path_buf()),
+            tracked: OnceLock::new(),
+        }
     }
 
+    #[cfg(test)]
     fn from_tracked(paths: BTreeSet<PathBuf>, ignore_case: bool) -> Self {
-        let tracked = paths.iter().map(|path| fold(path, ignore_case)).collect();
-        Self { tracked, ignore_case }
+        let tracked = OnceLock::new();
+        // This can only fail if we accidentally initialize the local cell
+        // twice, which is a programming error rather than a user-facing one.
+        tracked
+            .set(TrackedPaths {
+                paths: paths.iter().map(|path| fold(path, ignore_case)).collect(),
+                ignore_case,
+            })
+            .expect("new tracking cell is empty");
+        Self {
+            source: None,
+            tracked,
+        }
     }
 
     pub(crate) fn excludes(&self, path: &Path) -> bool {
-        name_excluded(path) && !self.protects(path)
+        // Git administrative data is part of the repository's history and
+        // metadata, not regenerable project output. Filtering inside it can
+        // corrupt refs such as `.git/refs/heads/build/main`.
+        !is_git_metadata(path) && name_excluded(path) && !self.protects(path)
     }
 
     /// True when `path` is itself tracked or is an ancestor of a tracked path.
@@ -51,11 +88,27 @@ impl CopyFilter {
     /// an index casing that differs from the on-disk casing still protects the
     /// committed file.
     fn protects(&self, path: &Path) -> bool {
-        let key = fold(path, self.ignore_case);
-        self.tracked
+        let tracked = self.tracked();
+        let key = fold(path, tracked.ignore_case);
+        tracked
+            .paths
             .range(key.clone()..)
             .next()
             .is_some_and(|candidate| candidate.starts_with(&key))
+    }
+
+    fn tracked(&self) -> &TrackedPaths {
+        self.tracked.get_or_init(|| {
+            let (paths, ignore_case) = self
+                .source
+                .as_deref()
+                .map(tracked_paths)
+                .unwrap_or_default();
+            TrackedPaths {
+                paths: paths.iter().map(|path| fold(path, ignore_case)).collect(),
+                ignore_case,
+            }
+        })
     }
 }
 
@@ -69,18 +122,27 @@ fn fold(path: &Path, ignore_case: bool) -> PathBuf {
 }
 
 fn name_excluded(path: &Path) -> bool {
-    let parts = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut previous = None;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        if excludes_component(part)
+            || previous.is_some_and(|parent| matches_yarn_artifact(parent, part))
+        {
+            return true;
+        }
+        previous = Some(part);
+    }
+    false
+}
 
-    parts.iter().any(|part| excludes_component(part))
-        || parts
-            .windows(2)
-            .any(|parts| matches_yarn_artifact(parts[0], parts[1]))
+/// Return true for any path inside Git administrative metadata. It is public
+/// within the crate so native filtered-copy strategies can avoid walking a
+/// large `.git` object database before cloning that subtree wholesale.
+pub(crate) fn is_git_metadata(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(part) if part == OsStr::new(".git")))
 }
 
 fn excludes_component(part: &OsStr) -> bool {
@@ -167,7 +229,11 @@ fn tracked_paths_cli(source: &Path) -> (BTreeSet<PathBuf>, bool) {
         .unwrap_or(false);
     let mut tracked = BTreeSet::new();
     if let Some(output) = git(&["ls-files", "-z"]) {
-        for raw in output.stdout.split(|byte| *byte == 0).filter(|s| !s.is_empty()) {
+        for raw in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|s| !s.is_empty())
+        {
             tracked.insert(PathBuf::from(OsStr::from_bytes(raw)));
         }
     }
@@ -194,6 +260,26 @@ mod tests {
         assert!(filter.excludes(Path::new("packages/app/node_modules/react/index.js")));
         assert!(filter.excludes(Path::new("packages/app/.yarn/cache/react.zip")));
         assert!(!filter.excludes(Path::new("packages/app/package-lock.json")));
+    }
+
+    #[test]
+    fn git_metadata_is_opaque_to_artifact_filtering() {
+        let filter = CopyFilter::unaware();
+
+        assert!(!filter.excludes(Path::new(".git/refs/heads/build/test")));
+        assert!(!filter.excludes(Path::new("vendor/.git/objects/pack/target")));
+        assert!(filter.excludes(Path::new("build/.gitignore")));
+    }
+
+    #[test]
+    fn source_tracking_is_loaded_only_for_an_exclusion_candidate() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let filter = CopyFilter::for_source(temp.path());
+
+        assert!(!filter.excludes(Path::new("src/main.rs")));
+        assert!(filter.tracked.get().is_none());
+        assert!(filter.excludes(Path::new("target/debug/app")));
+        assert!(filter.tracked.get().is_some());
     }
 
     #[test]

@@ -20,16 +20,16 @@ npm install -g rift-snapshot
 bun add -g rift-snapshot
 ```
 
-Release archives are available from [GitHub Releases](https://github.com/anomalyco/rift/releases/latest).
+Release archives are available from [GitHub Releases](https://github.com/jparklev/rift/releases/latest).
 
 ## Platforms
 
 | Platform          | Backend                             | Behavior                                                           |
 | ----------------- | ----------------------------------- | ------------------------------------------------------------------ |
-| Linux x64         | Writable btrfs snapshots            | `rift init` converts an ordinary directory into a btrfs subvolume. |
-| Linux x64         | Native per-file reflinks            | `rift init` verifies reflink support and registers the directory.  |
+| Linux x64 / arm64 | Writable btrfs snapshots            | `rift init` converts an ordinary directory into a btrfs subvolume. |
+| Linux x64 / arm64 | Native per-file reflinks            | `rift init` verifies reflink support and registers the directory.  |
 | macOS arm64 / x64 | APFS `clonefile`                    | `rift init` registers the source directory.                        |
-| Windows x64       | None                                | The package is published; workspace creation is not implemented.   |
+| Windows x64 / arm64 | None                                | The package is published; workspace creation is not implemented.   |
 
 ## CLI
 
@@ -107,10 +107,10 @@ rift status --json
 rift remove                         # remove the current created rift subtree
 rift remove -f ~/code/app           # unregister a source root
 rift remove --children ~/code/app   # remove descendants, preserve the selected workspace
-rift gc                             # physically delete leftover trash and prune missing entries
+rift gc                             # physically delete leftover trash
 ```
 
-Removing a created rift moves its active subtree into adjacent `.trash` storage and reclaims that storage immediately. If reclamation fails, the trash is kept and `rift gc` retries it.
+Removing a created rift moves its active subtree into adjacent `.trash` storage. `rift gc` reclaims that storage; it never treats a temporarily missing active workspace as deleted.
 
 Removing a source root requires `-f` in the CLI. The source directory remains on disk. Its `.rift` marker is removed. Existing registered descendants are moved into trash. Missing descendants are removed from the registry.
 
@@ -143,17 +143,18 @@ Default created-workspace storage is adjacent to the registered source root:
 The package selects a Bun or Node FFI binding through conditional exports.
 
 ```ts
-import { create, list, remove, gc } from "rift-snapshot";
+import { create, list, remove, status, gc } from "rift-snapshot";
 
 const workspace = create({ from: process.cwd(), name: "schema-work" });
 console.log(list({ of: process.cwd() }));
+console.log(status({ of: workspace }));
 remove({ at: workspace });
 gc();
 ```
 
 ### Node.js
 
-The Node binding requires the experimental FFI API in Node.js 26.1 or later:
+The Node binding requires the experimental FFI API in Node.js 26.1 or later. The package is tested with Node.js 26.5.0:
 
 ```bash
 node --experimental-ffi app.mjs
@@ -170,6 +171,7 @@ remove(options?: { at?: string; all?: false; database?: string }): void
 remove(options: { at?: string; all: true; database?: string }): string[]
 list(options?: { of?: string; database?: string }): string[]
 ancestors(options?: { of?: string; database?: string }): string[]
+status(options?: { of?: string; database?: string }): { path: string; id: string; parent: string | null }
 gc(options?: { database?: string }): string[]
 ```
 

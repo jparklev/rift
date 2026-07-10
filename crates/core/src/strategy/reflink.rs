@@ -193,7 +193,10 @@ pub(super) fn copy_metadata_linux(from: &Path, to: &Path, target: MetadataTarget
     // stamping metadata and apply the authoritative mode last. The transient
     // widen carries only permission bits — never setuid/setgid/sticky.
     if matches!(target, MetadataTarget::FileOrDirectory) {
-        fs::set_permissions(to, fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200))?;
+        fs::set_permissions(
+            to,
+            fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200),
+        )?;
     }
     copy_xattrs_linux(from, to)?;
     let times = [

@@ -1,5 +1,8 @@
 use super::Strategy;
-use crate::{CopyMode, Error, Result, filter::CopyFilter};
+use crate::{
+    CopyMode, Error, Result,
+    filter::{CopyFilter, is_git_metadata},
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +27,12 @@ impl Strategy for ApfsStrategy {
 fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
     let filter = CopyFilter::for_source(from);
     let mut dirty = HashSet::new();
-    scan_directory_apfs(from, Path::new(""), &filter, &mut dirty)?;
+    if !scan_directory_apfs(from, Path::new(""), &filter, &mut dirty)? {
+        // A filtered clone with no exclusions has exactly CopyMode::All's
+        // observable file-tree semantics. Avoid a second traversal and many
+        // individual clonefile calls on the overwhelmingly common clean path.
+        return clone_path_apfs(from, to);
+    }
     fs::create_dir(to)?;
     let mut hard_links = HashMap::new();
     clone_children_apfs(from, to, Path::new(""), &dirty, &filter, &mut hard_links)?;
@@ -44,11 +52,11 @@ fn scan_directory_apfs(
     for entry in fs::read_dir(root.join(rel))? {
         let entry = entry?;
         let rel_child = rel.join(entry.file_name());
-        if filter.excludes(&rel_child) {
-            is_dirty = true;
-        } else if entry.file_type()?.is_dir()
-            && scan_directory_apfs(root, &rel_child, filter, dirty)?
-        {
+        let child_is_dirty = filter.excludes(&rel_child)
+            || (entry.file_type()?.is_dir()
+                && !is_git_metadata(&rel_child)
+                && scan_directory_apfs(root, &rel_child, filter, dirty)?);
+        if child_is_dirty {
             is_dirty = true;
         }
     }
@@ -152,7 +160,10 @@ fn copy_metadata_apfs(from: &Path, to: &Path, target: MetadataTarget) -> Result<
     // apply the authoritative (possibly read-only) mode last. The transient
     // widen carries only permission bits — never setuid/setgid/sticky.
     if matches!(target, MetadataTarget::FileOrDirectory) {
-        fs::set_permissions(to, fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200))?;
+        fs::set_permissions(
+            to,
+            fs::Permissions::from_mode((metadata.mode() & 0o777) | 0o200),
+        )?;
     }
     copy_xattrs_apfs(from, to)?;
     let times = [
@@ -278,6 +289,35 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::TempDir;
+
+    #[test]
+    fn git_metadata_is_not_scanned_as_filtered_content() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join(".git/refs/heads/build")).unwrap();
+        fs::write(source.join(".git/refs/heads/build/test"), "ref").unwrap();
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "dep").unwrap();
+        let filter = CopyFilter::for_source(&source);
+        let mut dirty = HashSet::new();
+
+        assert!(scan_directory_apfs(&source, Path::new(""), &filter, &mut dirty).unwrap());
+        assert!(!dirty.contains(Path::new(".git")));
+        assert!(!dirty.contains(Path::new(".git/refs/heads/build")));
+    }
+
+    #[test]
+    fn clean_filtered_tree_has_no_dirty_directories() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let filter = CopyFilter::for_source(&source);
+        let mut dirty = HashSet::new();
+
+        assert!(!scan_directory_apfs(&source, Path::new(""), &filter, &mut dirty).unwrap());
+        assert!(dirty.is_empty());
+    }
 
     #[test]
     fn strategy_clones_and_removes_a_workspace() {
@@ -463,7 +503,11 @@ mod tests {
             Path::new("file.txt")
         );
         assert_eq!(
-            fs::metadata(cloned.join("file.txt")).unwrap().permissions().mode() & 0o777,
+            fs::metadata(cloned.join("file.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o640
         );
         assert_eq!(

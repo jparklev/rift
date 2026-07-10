@@ -9,6 +9,9 @@ use crate::{CopyMode, Error, InitProgress, Result};
 use std::fs;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+
 pub(super) struct BtrfsStrategy;
 
 impl Strategy for BtrfsStrategy {
@@ -57,6 +60,10 @@ fn initialize_directory_linux(
     path: &Path,
     progress: &mut dyn FnMut(InitProgress),
 ) -> Result<StrategyInit> {
+    ensure_real_directory(path, "workspace")?;
+    if let Some(recovered) = recover_pending_initialization(path)? {
+        return Ok(recovered);
+    }
     if !is_btrfs_filesystem(path)? {
         return Err(Error::CowUnavailable(format!(
             "{} is not on a btrfs filesystem",
@@ -67,48 +74,452 @@ fn initialize_directory_linux(
         return Ok(StrategyInit::AlreadyNative);
     }
 
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Path(format!("workspace has no parent: {}", path.display())))?;
-    let operation_id = ulid::Ulid::new();
-    let staging = parent.join(format!(".rift-init-{operation_id}"));
-    let original = parent.join(format!(".rift-init-original-{operation_id}"));
-
-    progress(InitProgress::CreatingSubvolume);
-    create_btrfs_subvolume(&staging)?;
-
-    let result = (|| {
+    let pending = create_pending_initialization(path)?;
+    let preparation = (|| {
+        progress(InitProgress::CreatingSubvolume);
+        create_btrfs_subvolume(&pending.staging)?;
         progress(InitProgress::ImportingWorkspace);
-        import_directory_linux(path, &staging, progress)?;
-        progress(InitProgress::ActivatingWorkspace);
-        fs::rename(path, &original).map_err(|error| {
-            Error::CowUnavailable(format!(
-                "failed to move original workspace aside for activation: {error}"
-            ))
-        })?;
-        if let Err(error) = fs::rename(&staging, path) {
-            return match fs::rename(&original, path) {
-                Ok(()) => Err(Error::CowUnavailable(format!(
-                    "failed to activate initialized workspace; restored the original workspace: {error}"
-                ))),
-                Err(rollback) => Err(Error::CowUnavailable(format!(
-                    "failed to activate initialized workspace: {error}; also failed to restore the original workspace: {rollback}"
-                ))),
-            };
-        }
-        copy_metadata_linux(&original, path, MetadataTarget::FileOrDirectory)?;
-        progress(InitProgress::RemovingOriginal);
-        fs::remove_dir_all(&original).map_err(|error| {
-            Error::CowUnavailable(format!(
-                "initialized workspace is active but failed to remove the original directory: {error}"
-            ))
-        })?;
-        Ok(StrategyInit::Converted)
+        import_directory_linux(path, &pending.staging, progress)?;
+        // Copy the root metadata before activation. Once the workspace is
+        // visible at `path`, every remaining operation is cleanup-only and can
+        // be resumed safely on the next `init`.
+        copy_metadata_linux(path, &pending.staging, MetadataTarget::FileOrDirectory)?;
+        Ok(())
     })();
-    if result.is_err() && staging.exists() {
-        let _ = remove_directory_linux(&staging);
+    if let Err(error) = preparation {
+        return fail_pre_activation(path, error);
     }
-    result
+
+    progress(InitProgress::ActivatingWorkspace);
+    if let Err(error) = rename_exchange(path, &pending.staging) {
+        return fail_pre_activation(path, error);
+    }
+    sync_parent(path)?;
+
+    progress(InitProgress::RemovingOriginal);
+    remove_regular_directory(&pending.staging)?;
+    remove_pending_initialization(&pending)?;
+    Ok(StrategyInit::Converted)
+}
+
+#[cfg(target_os = "linux")]
+const INIT_STATE_HEADER: &str = "rift-btrfs-init-v1";
+#[cfg(target_os = "linux")]
+const MAX_INIT_STATE_BYTES: u64 = 1024;
+
+/// A durable marker for the one operation that may be in flight for a given
+/// workspace path. It lives beside the workspace rather than inside it, so it
+/// survives the exchange that activates the new btrfs subvolume.
+#[cfg(target_os = "linux")]
+struct PendingInitialization {
+    state: PathBuf,
+    staging: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn create_pending_initialization(path: &Path) -> Result<PendingInitialization> {
+    let operation = ulid::Ulid::new();
+    let pending = pending_initialization(path, operation)?;
+    let contents = init_state_contents(path, operation)?;
+    write_new_state(&pending.state, &contents)?;
+    Ok(pending)
+}
+
+#[cfg(target_os = "linux")]
+fn pending_initialization(path: &Path, operation: ulid::Ulid) -> Result<PendingInitialization> {
+    let parent = workspace_parent(path)?;
+    Ok(PendingInitialization {
+        state: init_state_path(path)?,
+        staging: parent.join(format!(".rift-init-{operation}")),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn recover_pending_initialization(path: &Path) -> Result<Option<StrategyInit>> {
+    let Some(pending) = read_pending_initialization(path)? else {
+        return Ok(None);
+    };
+
+    ensure_real_directory(path, "workspace")?;
+    let workspace_is_subvolume = is_btrfs_subvolume(path)?;
+    let staging = directory_entry(&pending.staging, "initialization staging directory")?;
+
+    match (workspace_is_subvolume, staging) {
+        // The state was published before the staging subvolume was made, or it
+        // was removed after an interrupted import. The original workspace is
+        // still in place, so discard the incomplete operation and start over.
+        (false, DirectoryEntry::Missing) => {
+            remove_pending_initialization(&pending)?;
+            Ok(None)
+        }
+        // The exchange has not happened yet. A staged subvolume is safe to
+        // remove because the original workspace remains at `path`.
+        (false, DirectoryEntry::Directory) if is_btrfs_subvolume(&pending.staging)? => {
+            remove_directory_linux(&pending.staging)?;
+            remove_pending_initialization(&pending)?;
+            Ok(None)
+        }
+        // `renameat2(RENAME_EXCHANGE)` has already made the btrfs subvolume
+        // live. The staging path now contains the former ordinary directory;
+        // complete that cleanup before declaring the conversion recovered.
+        (true, DirectoryEntry::Missing) => {
+            remove_pending_initialization(&pending)?;
+            Ok(Some(StrategyInit::Converted))
+        }
+        (true, DirectoryEntry::Directory) if !is_btrfs_subvolume(&pending.staging)? => {
+            remove_regular_directory(&pending.staging)?;
+            remove_pending_initialization(&pending)?;
+            Ok(Some(StrategyInit::Converted))
+        }
+        (false, DirectoryEntry::Directory) => Err(invalid_initialization_state(
+            path,
+            "the staging path is not a btrfs subvolume before activation",
+        )),
+        (true, DirectoryEntry::Directory) => Err(invalid_initialization_state(
+            path,
+            "the staging path is unexpectedly still a btrfs subvolume after activation",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fail_pre_activation(path: &Path, error: Error) -> Result<StrategyInit> {
+    match recover_pending_initialization(path) {
+        Ok(None) => Err(error),
+        Ok(Some(_)) => Err(Error::CowUnavailable(format!(
+            "{error}; initialization unexpectedly activated while cleaning up"
+        ))),
+        Err(recovery) => Err(Error::CowUnavailable(format!(
+            "{error}; initialization cleanup requires recovery: {recovery}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn init_state_path(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Path(format!("workspace has no name: {}", path.display())))?;
+    let hash = name
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    Ok(workspace_parent(path)?.join(format!(".rift-init-state-{hash:016x}")))
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_parent(path: &Path) -> Result<&Path> {
+    path.parent()
+        .ok_or_else(|| Error::Path(format!("workspace has no parent: {}", path.display())))
+}
+
+#[cfg(target_os = "linux")]
+fn init_state_contents(path: &Path, operation: ulid::Ulid) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Path(format!("workspace has no name: {}", path.display())))?;
+    let mut target = String::with_capacity(name.as_bytes().len() * 2);
+    for byte in name.as_bytes() {
+        use std::fmt::Write;
+
+        write!(&mut target, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(format!(
+        "{INIT_STATE_HEADER}\ntarget={target}\noperation={operation}\n"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_pending_initialization(path: &Path) -> Result<Option<PendingInitialization>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let state = init_state_path(path)?;
+    let metadata = match secure_state_metadata(&state) {
+        Ok(metadata) => metadata,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&state)?;
+    let opened = file.metadata()?;
+    ensure_secure_state_metadata(&state, &opened)?;
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err(invalid_initialization_state(
+                path,
+                "the sidecar changed while it was being opened",
+            ));
+        }
+    }
+    let mut contents = String::new();
+    file.by_ref()
+        .take(MAX_INIT_STATE_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_INIT_STATE_BYTES {
+        return Err(invalid_initialization_state(
+            path,
+            "the sidecar is too large",
+        ));
+    }
+    let operation = parse_init_state(path, &contents)?;
+    Ok(Some(pending_initialization(path, operation)?))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_init_state(path: &Path, contents: &str) -> Result<ulid::Ulid> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut lines = contents.lines();
+    let header = lines.next();
+    let target = lines.next().and_then(|line| line.strip_prefix("target="));
+    let operation = lines
+        .next()
+        .and_then(|line| line.strip_prefix("operation="));
+    if header != Some(INIT_STATE_HEADER) || lines.next().is_some() {
+        return Err(invalid_initialization_state(
+            path,
+            "the sidecar format is invalid",
+        ));
+    }
+    let target =
+        target.ok_or_else(|| invalid_initialization_state(path, "the target is missing"))?;
+    let expected = path
+        .file_name()
+        .ok_or_else(|| Error::Path(format!("workspace has no name: {}", path.display())))?
+        .as_bytes();
+    if decode_hex(target)? != expected {
+        return Err(invalid_initialization_state(
+            path,
+            "the sidecar belongs to another workspace",
+        ));
+    }
+    operation
+        .ok_or_else(|| invalid_initialization_state(path, "the operation is missing"))?
+        .parse()
+        .map_err(|_| invalid_initialization_state(path, "the operation identifier is invalid"))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if value.is_empty() || value.len() % 2 != 0 {
+        return Err(Error::CowUnavailable(
+            "invalid btrfs initialization state encoding".into(),
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|bytes| {
+            let high = hex_digit(bytes[0])?;
+            let low = hex_digit(bytes[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(Error::CowUnavailable(
+            "invalid btrfs initialization state encoding".into(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_new_state(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = workspace_parent(path)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::Path(format!("state has no name: {}", path.display())))?;
+    let temporary = parent.join(format!(
+        ".{}-tmp-{}",
+        file_name.to_string_lossy(),
+        ulid::Ulid::new()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)?;
+    let write_result = (|| {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        rename_no_replace(&temporary, path)?;
+        sync_parent(path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(target_os = "linux")]
+fn remove_pending_initialization(pending: &PendingInitialization) -> Result<()> {
+    secure_state_metadata(&pending.state)?;
+    fs::remove_file(&pending.state)?;
+    sync_parent(&pending.state)
+}
+
+#[cfg(target_os = "linux")]
+fn secure_state_metadata(path: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure_secure_state_metadata(path, &metadata)?;
+    Ok(metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_secure_state_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Error::CowUnavailable(format!(
+            "refusing unsafe btrfs initialization sidecar: {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(Error::CowUnavailable(format!(
+            "refusing insecure btrfs initialization sidecar: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sync_parent(path: &Path) -> Result<()> {
+    use std::fs::File;
+
+    File::open(workspace_parent(path)?)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_exchange(from: &Path, to: &Path) -> Result<()> {
+    renameat2(
+        from,
+        to,
+        libc::RENAME_EXCHANGE,
+        "atomically exchange workspace and staging",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
+    renameat2(
+        from,
+        to,
+        libc::RENAME_NOREPLACE,
+        "publish initialization state",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2(from: &Path, to: &Path, flags: u32, action: &str) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| Error::Path(format!("path contains a null byte: {}", from.display())))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| Error::Path(format!("path contains a null byte: {}", to.display())))?;
+    // SAFETY: both paths are NUL-terminated C strings, and the arguments are
+    // the documented `renameat2` syscall ABI. Using the syscall directly
+    // avoids a glibc-only `renameat2` symbol, so musl builds retain the same
+    // atomic protocol.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    Err(Error::CowUnavailable(format!(
+        "failed to {action}: {error}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_regular_directory(path: &Path) -> Result<()> {
+    ensure_real_directory(path, "initialization staging directory")?;
+    if is_btrfs_subvolume(path)? {
+        return Err(Error::CowUnavailable(format!(
+            "refusing to remove btrfs staging subvolume as an original workspace: {}",
+            path.display()
+        )));
+    }
+    fs::remove_dir_all(path)?;
+    sync_parent(path)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryEntry {
+    Missing,
+    Directory,
+}
+
+#[cfg(target_os = "linux")]
+fn directory_entry(path: &Path, description: &str) -> Result<DirectoryEntry> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(Error::CowUnavailable(format!(
+                    "refusing unsafe {description}: {}",
+                    path.display()
+                )));
+            }
+            Ok(DirectoryEntry::Directory)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DirectoryEntry::Missing),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_real_directory(path: &Path, description: &str) -> Result<()> {
+    match directory_entry(path, description)? {
+        DirectoryEntry::Directory => Ok(()),
+        DirectoryEntry::Missing => Err(Error::CowUnavailable(format!(
+            "{description} is missing: {}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_initialization_state(path: &Path, detail: &str) -> Error {
+    Error::CowUnavailable(format!(
+        "invalid btrfs initialization state for {}: {detail}",
+        path.display()
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -315,6 +726,32 @@ mod linux_tests {
         value
     }
 
+    fn staged_initialization(source: &Path) -> PendingInitialization {
+        let pending = create_pending_initialization(source).unwrap();
+        create_btrfs_subvolume(&pending.staging).unwrap();
+        import_directory_linux(source, &pending.staging, &mut |_| {}).unwrap();
+        copy_metadata_linux(source, &pending.staging, MetadataTarget::FileOrDirectory).unwrap();
+        pending
+    }
+
+    #[test]
+    fn initialization_sidecar_symlink_is_rejected_without_following_it() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let victim = temp.path().join("victim");
+        fs::create_dir(&source).unwrap();
+        fs::write(&victim, "do not touch").unwrap();
+        let state = init_state_path(&source).unwrap();
+        std::os::unix::fs::symlink(&victim, &state).unwrap();
+
+        assert!(matches!(
+            recover_pending_initialization(&source),
+            Err(Error::CowUnavailable(message)) if message.contains("unsafe btrfs initialization sidecar")
+        ));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "do not touch");
+        assert_eq!(fs::read_link(&state).unwrap(), victim);
+    }
+
     #[test]
     fn native_init_imports_files_links_metadata_and_progress() {
         let Some(temp) = btrfs_temp() else {
@@ -339,6 +776,10 @@ mod linux_tests {
             StrategyInit::Converted
         );
         assert!(is_btrfs_subvolume(&source).unwrap());
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
         assert_eq!(
             fs::read_to_string(source.join("nested/file.txt")).unwrap(),
             "hello"
@@ -372,6 +813,64 @@ mod linux_tests {
                 .iter()
                 .any(|event| matches!(event, InitProgress::ImportedEntries { .. }))
         );
+        remove_directory_linux(&source).unwrap();
+    }
+
+    #[test]
+    fn native_init_retries_an_interrupted_pre_activation_operation() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "preserve me").unwrap();
+        let pending = staged_initialization(&source);
+        assert_eq!(
+            fs::metadata(&pending.state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(is_btrfs_subvolume(&pending.staging).unwrap());
+
+        assert_eq!(
+            initialize_directory_linux(&source, &mut |_| {}).unwrap(),
+            StrategyInit::Converted
+        );
+        assert!(is_btrfs_subvolume(&source).unwrap());
+        assert_eq!(
+            fs::read_to_string(source.join("file.txt")).unwrap(),
+            "preserve me"
+        );
+        assert!(!pending.staging.exists());
+        assert!(!pending.state.exists());
+        remove_directory_linux(&source).unwrap();
+    }
+
+    #[test]
+    fn native_init_finishes_cleanup_after_an_interrupted_exchange() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "preserve me").unwrap();
+        let pending = staged_initialization(&source);
+
+        rename_exchange(&source, &pending.staging).unwrap();
+        sync_parent(&source).unwrap();
+        assert!(is_btrfs_subvolume(&source).unwrap());
+        assert!(!is_btrfs_subvolume(&pending.staging).unwrap());
+
+        assert_eq!(
+            initialize_directory_linux(&source, &mut |_| {}).unwrap(),
+            StrategyInit::Converted
+        );
+        assert!(is_btrfs_subvolume(&source).unwrap());
+        assert_eq!(
+            fs::read_to_string(source.join("file.txt")).unwrap(),
+            "preserve me"
+        );
+        assert!(!pending.staging.exists());
+        assert!(!pending.state.exists());
         remove_directory_linux(&source).unwrap();
     }
 

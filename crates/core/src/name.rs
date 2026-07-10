@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use rand::Rng;
+use rand::RngExt;
 use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +14,7 @@ impl RiftName {
         if name.is_empty()
             || name == "."
             || name == ".."
+            || matches!(name.as_str(), ".rift" | ".trash")
             || Path::new(&name).components().count() != 1
         {
             return Err(Error::Path(format!("invalid rift name: {name}")));
@@ -23,6 +24,23 @@ impl RiftName {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// A fresh readable name for automatic destination selection. Callers
+    /// still need to check the filesystem; the word list intentionally keeps
+    /// the normal name space compact and pleasant rather than pretending it is
+    /// globally unique.
+    pub(crate) fn generated() -> Self {
+        Self(generated_name())
+    }
+
+    /// Retain the readable stem while adding a collision-resistant fallback.
+    pub(crate) fn generated_with_suffix(suffix: &str) -> Self {
+        Self(format!(
+            "{}-{}",
+            generated_name(),
+            suffix.to_ascii_lowercase()
+        ))
     }
 }
 
@@ -58,6 +76,8 @@ mod tests {
         assert!(RiftName::new(String::new()).is_err());
         assert!(RiftName::new(".".into()).is_err());
         assert!(RiftName::new("..".into()).is_err());
+        assert!(RiftName::new(".rift".into()).is_err());
+        assert!(RiftName::new(".trash".into()).is_err());
         assert!(RiftName::new("parent/child".into()).is_err());
     }
 

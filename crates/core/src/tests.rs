@@ -5,6 +5,9 @@ use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -37,6 +40,43 @@ fn child_path(source: &Path, name: &str) -> PathBuf {
     source.parent().unwrap().join(".rifts/app").join(name)
 }
 
+struct BlockingCopyStrategy {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl Strategy for BlockingCopyStrategy {
+    fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
+        // `Manager::create` reaches this only after acquiring the root lock.
+        self.entered.wait();
+        self.release.wait();
+        TestStrategy.copy_directory(from, to, mode)
+    }
+}
+
+struct BlockingInitStrategy {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl Strategy for BlockingInitStrategy {
+    fn copy_directory(&self, _from: &Path, _to: &Path, _mode: CopyMode) -> Result<()> {
+        unreachable!()
+    }
+
+    fn initialize_directory(
+        &self,
+        _path: &Path,
+        _progress: &mut dyn FnMut(InitProgress),
+    ) -> Result<StrategyInit> {
+        // `Manager::init` reaches this only after acquiring the path-derived
+        // first-initialization lock.
+        self.entered.wait();
+        self.release.wait();
+        Ok(StrategyInit::AlreadyNative)
+    }
+}
+
 #[test]
 fn create_tracks_parentage_and_default_storage() {
     let temp = TempDir::new().unwrap();
@@ -59,6 +99,123 @@ fn create_tracks_parentage_and_default_storage() {
     );
     assert_eq!(manager.list(&source).unwrap(), vec![first.clone()]);
     assert_eq!(manager.ancestors(&second).unwrap(), vec![first, source]);
+}
+
+#[test]
+fn root_remove_waits_for_an_inflight_create_before_unregistering() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let database = temp.path().join("registry.sqlite");
+    let mut setup = manager(&temp);
+    setup.init(&source).unwrap();
+    drop(setup);
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let create_source = source.clone();
+    let create_database = database.clone();
+    let create_entered = entered.clone();
+    let create_release = release.clone();
+    let create = thread::spawn(move || {
+        let mut manager = Manager::with_strategy(
+            create_database,
+            Box::new(BlockingCopyStrategy {
+                entered: create_entered,
+                release: create_release,
+            }),
+        )
+        .unwrap();
+        manager.create(Create::new(create_source).named("racing-child"))
+    });
+
+    // The create owns the root lock and is paused in its copy strategy.
+    entered.wait();
+    let (removed_tx, removed_rx) = mpsc::channel();
+    let remove_source = source.clone();
+    let remove_database = database;
+    let remove = thread::spawn(move || {
+        let mut manager = Manager::with_strategy(remove_database, Box::new(TestStrategy)).unwrap();
+        let result = manager.remove(remove_source);
+        removed_tx.send(result).unwrap();
+    });
+
+    let early_remove = removed_rx.recv_timeout(Duration::from_millis(100));
+    let removal_bypassed_lock = early_remove.is_ok();
+    // Always unblock the creator before asserting so a failed regression never
+    // strands a test thread at the barrier.
+    release.wait();
+    let child = create.join().unwrap().unwrap();
+    let removed = match early_remove {
+        Ok(result) => result,
+        Err(_) => removed_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+    };
+    remove.join().unwrap();
+
+    assert!(
+        !removal_bypassed_lock,
+        "root removal bypassed the create lock"
+    );
+    removed.unwrap();
+    assert!(!child.exists());
+    let reopened = manager(&temp);
+    assert!(matches!(
+        reopened.list(&source),
+        Err(Error::WorkspaceNotInitialized(_))
+    ));
+}
+
+#[test]
+fn concurrent_first_initialization_keeps_the_winning_marker() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let database = temp.path().join("registry.sqlite");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let first_source = source.clone();
+    let first_database = database.clone();
+    let first_entered = entered.clone();
+    let first_release = release.clone();
+    let first = thread::spawn(move || {
+        let mut manager = Manager::with_strategy(
+            first_database,
+            Box::new(BlockingInitStrategy {
+                entered: first_entered,
+                release: first_release,
+            }),
+        )
+        .unwrap();
+        manager.init(first_source)
+    });
+
+    // The first init holds the canonical-path lock while its strategy pauses.
+    entered.wait();
+    let (second_tx, second_rx) = mpsc::channel();
+    let second_source = source.clone();
+    let second = thread::spawn(move || {
+        let mut manager = Manager::with_strategy(database, Box::new(TestStrategy)).unwrap();
+        second_tx.send(manager.init(second_source)).unwrap();
+    });
+    let early_second = second_rx.recv_timeout(Duration::from_millis(100));
+    let second_bypassed_lock = early_second.is_ok();
+
+    // Always release the first initializer before asserting so a regression
+    // cannot leave a test thread trapped at the barrier.
+    release.wait();
+    assert_eq!(first.join().unwrap().unwrap(), InitOutcome::Registered);
+    let second_outcome = match early_second {
+        Ok(outcome) => outcome,
+        Err(_) => second_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+    };
+    second.join().unwrap();
+
+    assert!(
+        !second_bypassed_lock,
+        "second initializer bypassed the path lock"
+    );
+    assert_eq!(second_outcome.unwrap(), InitOutcome::AlreadyInitialized);
+    let verified = manager(&temp);
+    assert!(source.join(".rift").is_file());
+    assert_eq!(verified.describe(&source).unwrap().parent, None);
 }
 
 #[test]
@@ -115,6 +272,10 @@ fn create_supports_custom_storage_and_rejects_invalid_destinations() {
     ));
     assert!(matches!(
         manager.create(Create::new(source.clone()).named("..")),
+        Err(Error::Path(_))
+    ));
+    assert!(matches!(
+        manager.create(Create::new(source.clone()).named(".trash")),
         Err(Error::Path(_))
     ));
     assert!(matches!(
@@ -359,6 +520,175 @@ fn gc_forgets_a_trashed_path_already_removed_on_disk() {
 }
 
 #[test]
+fn reopening_recovers_a_move_staged_before_registry_transfer() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut initial = manager(&temp);
+    initial.init(&source).unwrap();
+    let child = initial
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    let child_id = marker_id(&child);
+    let trash = trash_path(&child_id, &child).unwrap();
+    let root = initial
+        .root(&initial.workspace_at(&source).unwrap())
+        .unwrap();
+    let operation = initial
+        .registry
+        .stage_removal(
+            &root,
+            false,
+            &[MovedRecord {
+                id: child_id,
+                original_path: child.clone(),
+                trash_path: trash.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Model the exact crash window: the durable intent and filesystem rename
+    // exist, but the active-to-trash registry transaction has not run.
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::rename(&child, &trash).unwrap();
+    drop(initial);
+
+    let mut recovered = manager(&temp);
+    assert!(!child.exists());
+    assert!(trash.exists());
+    assert!(
+        recovered
+            .registry
+            .pending_removal(&operation.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(recovered.list(&source).unwrap().is_empty());
+    assert_eq!(recovered.gc().unwrap(), vec![trash]);
+}
+
+#[test]
+fn ambiguous_pending_removal_blocks_only_its_own_root() {
+    let temp = TempDir::new().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    fs::write(left.join("file.txt"), "left").unwrap();
+    fs::write(right.join("file.txt"), "right").unwrap();
+    let mut initial = manager(&temp);
+    initial.init(&left).unwrap();
+    initial.init(&right).unwrap();
+    let child = initial
+        .create(Create::new(left.clone()).named("child"))
+        .unwrap();
+    let child_id = marker_id(&child);
+    let trash = trash_path(&child_id, &child).unwrap();
+    let root = initial.root(&initial.workspace_at(&left).unwrap()).unwrap();
+    initial
+        .registry
+        .stage_removal(
+            &root,
+            false,
+            &[MovedRecord {
+                id: child_id,
+                original_path: child.clone(),
+                trash_path: trash.clone(),
+            }],
+        )
+        .unwrap();
+    // Model an ambiguous crash/manual-intervention state. Recovery must not
+    // guess which copy is authoritative, but it also must not brick unrelated
+    // roots sharing this registry.
+    fs::create_dir_all(&trash).unwrap();
+    drop(initial);
+
+    let mut recovered = manager(&temp);
+    assert_eq!(recovered.describe(&right).unwrap().parent, None);
+    assert!(matches!(recovered.remove(&child), Err(Error::AlreadyExists(path)) if path == trash));
+    assert!(
+        recovered
+            .create(Create::new(right).named("still-works"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn init_recovers_pending_root_unregistration_before_restoring_a_marker() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let mut initial = manager(&temp);
+    initial.init(&source).unwrap();
+    let child = initial
+        .create(Create::new(source.clone()).named("child"))
+        .unwrap();
+    // Open before the removal is staged, which models a second process whose
+    // startup recovery has already run.
+    let mut contender = manager(&temp);
+    let child_id = marker_id(&child);
+    let trash = trash_path(&child_id, &child).unwrap();
+    let root = initial
+        .root(&initial.workspace_at(&source).unwrap())
+        .unwrap();
+    initial
+        .registry
+        .stage_removal(
+            &root,
+            true,
+            &[MovedRecord {
+                id: child_id,
+                original_path: child.clone(),
+                trash_path: trash.clone(),
+            }],
+        )
+        .unwrap();
+    fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    fs::rename(&child, &trash).unwrap();
+    marker::remove_regular(&source).unwrap();
+    drop(initial);
+
+    assert!(matches!(
+        contender.init(&source),
+        Err(Error::WorkspaceNotInitialized(path)) if path == source
+    ));
+    assert!(!source.join(".rift").exists());
+    assert!(matches!(
+        contender.list(&source),
+        Err(Error::WorkspaceNotInitialized(_))
+    ));
+}
+
+#[test]
+fn gc_never_unregisters_an_unrelated_temporarily_absent_root() {
+    let temp = TempDir::new().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    fs::create_dir(&left).unwrap();
+    fs::create_dir(&right).unwrap();
+    fs::write(left.join("file.txt"), "left").unwrap();
+    fs::write(right.join("file.txt"), "right").unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&left).unwrap();
+    manager.init(&right).unwrap();
+    let child = manager
+        .create(Create::new(left.clone()).named("child"))
+        .unwrap();
+    manager.remove(&child).unwrap();
+
+    let absent = temp.path().join("right-absent");
+    fs::rename(&right, &absent).unwrap();
+    manager.gc().unwrap();
+    fs::rename(&absent, &right).unwrap();
+
+    let described = manager.describe(&right).unwrap();
+    assert_eq!(described.path, fs::canonicalize(&right).unwrap());
+    assert_eq!(described.parent, None);
+    assert_eq!(
+        manager.init(&right).unwrap(),
+        InitOutcome::AlreadyInitialized
+    );
+}
+
+#[test]
 fn operations_use_the_nearest_ancestor_marker() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
@@ -493,6 +823,67 @@ fn create_generates_readable_names_independent_of_ulid_identity() {
     );
     assert!(Ulid::from_string(id).is_ok());
     assert_ne!(name, id);
+}
+
+#[test]
+fn generated_destinations_retry_then_use_a_unique_id_suffix() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("storage");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(parent.join("taken")).unwrap();
+    let id = RiftId::from_stored("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+    let mut names = ["taken", "available"].into_iter();
+
+    let retried = generated_destination_with(&parent, &id, || {
+        RiftName::from_optional(Some(names.next().unwrap().to_owned())).unwrap()
+    })
+    .unwrap();
+    assert_eq!(retried, parent.join("available"));
+
+    let fallback = generated_destination_with(&parent, &id, || {
+        RiftName::from_optional(Some("taken".to_owned())).unwrap()
+    })
+    .unwrap();
+    assert!(
+        fallback
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&id.as_str().to_ascii_lowercase())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_and_create_reject_marker_symlinks_without_touching_their_targets() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let external = temp.path().join("external-marker");
+    std::os::unix::fs::symlink(&external, source.join(".rift")).unwrap();
+    let mut manager = manager(&temp);
+
+    assert!(matches!(manager.init(&source), Err(Error::UnsafeMarker(_))));
+    assert!(!external.exists());
+    assert!(
+        fs::symlink_metadata(source.join(".rift"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_file(source.join(".rift")).unwrap();
+    manager.init(&source).unwrap();
+    let original = fs::read_to_string(source.join(".rift")).unwrap();
+    fs::remove_file(source.join(".rift")).unwrap();
+    fs::write(&external, &original).unwrap();
+    std::os::unix::fs::symlink(&external, source.join(".rift")).unwrap();
+
+    assert!(matches!(
+        manager.create(Create::new(source.clone()).named("unsafe-marker")),
+        Err(Error::UnsafeMarker(_))
+    ));
+    assert_eq!(fs::read_to_string(&external).unwrap(), original);
+    assert!(!child_path(&source, "unsafe-marker").exists());
 }
 
 #[test]
@@ -691,7 +1082,7 @@ fn gc_has_no_effect_on_active_rifts() {
 }
 
 #[test]
-fn gc_prunes_active_entries_deleted_outside_rift() {
+fn gc_preserves_active_entries_deleted_outside_rift() {
     let temp = TempDir::new().unwrap();
     let source = source(&temp);
     let mut manager = manager(&temp);
@@ -705,10 +1096,12 @@ fn gc_prunes_active_entries_deleted_outside_rift() {
     fs::remove_dir_all(&first).unwrap();
     fs::remove_dir_all(&second).unwrap();
 
-    let removed = manager.gc().unwrap();
-    assert!(removed.contains(&first));
-    assert!(removed.contains(&second));
-    assert!(manager.list(&source).unwrap().is_empty());
+    assert!(manager.gc().unwrap().is_empty());
+    assert_eq!(manager.list(&source).unwrap(), vec![first]);
+    assert!(matches!(
+        manager.describe(&second),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
 }
 
 #[test]
@@ -819,6 +1212,41 @@ fn git_copy_peels_symbolic_tag_heads_to_commits() {
         fs::read_to_string(destination.join(".git/HEAD")).unwrap(),
         format!("{}\n", String::from_utf8_lossy(&expected.stdout).trim())
     );
+}
+
+#[test]
+fn filtered_git_copy_preserves_refs_named_like_build_artifacts() {
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    run(&source, &["init"]);
+    run(&source, &["config", "user.email", "test@example.com"]);
+    run(&source, &["config", "user.name", "Test"]);
+    run(&source, &["add", "file.txt"]);
+    run(&source, &["commit", "-m", "initial"]);
+    let expected = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let expected = String::from_utf8(expected.stdout).unwrap();
+    fs::create_dir_all(source.join(".git/refs/heads/build")).unwrap();
+    fs::write(source.join(".git/refs/heads/build/test"), &expected).unwrap();
+    let mut manager = manager(&temp);
+    manager.init(&source).unwrap();
+
+    let destination = manager
+        .create(Create::new(source).named("build-ref"))
+        .unwrap();
+    let observed = Command::new("git")
+        .arg("-C")
+        .arg(&destination)
+        .args(["rev-parse", "refs/heads/build/test"])
+        .output()
+        .unwrap();
+
+    assert!(observed.status.success());
+    assert_eq!(observed.stdout, expected.as_bytes());
 }
 
 #[test]
@@ -1067,7 +1495,9 @@ fn describe_reports_root_child_and_dangling_parent() {
     // error must name the real problem (a dangling parent reference), not
     // claim the child itself is unmanaged.
     let database = rusqlite::Connection::open(temp.path().join("registry.sqlite")).unwrap();
-    database.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    database
+        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .unwrap();
     database
         .execute("DELETE FROM rift WHERE parent_id IS NULL", [])
         .unwrap();
