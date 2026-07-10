@@ -1,0 +1,22 @@
+{
+  "name": "@jparklev/rift-windows-arm64",
+  "version": "0.0.11",
+  "description": "Rift native artifacts for Windows arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jparklev/rift.git"
+  },
+  "files": ["bin", "lib"],
+  "os": ["win32"],
+  "cpu": ["arm64"],
+  "preferUnplugged": true,
+  "rift": {
+    "binary": "bin/rift.exe",
+    "library": "lib/rift_ffi.dll"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

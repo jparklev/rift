@@ -1,0 +1,22 @@
+{
+  "name": "@jparklev/rift-linux-arm64",
+  "version": "0.0.11",
+  "description": "Rift native artifacts for Linux arm64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jparklev/rift.git"
+  },
+  "files": ["bin", "lib"],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "preferUnplugged": true,
+  "rift": {
+    "binary": "bin/rift",
+    "library": "lib/librift_ffi.so"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NPM_VERSION: "12.0.1"
+
 jobs:
   test:
     name: Test
@@ -75,6 +78,42 @@ jobs:
           bash scripts/ci/linux-fs.sh "${{ matrix.filesystem }}" -- \
             env ${{ matrix.required_env }}=1 cargo test --package rift --package rift-cli --locked
 
+  linux-package-test:
+    name: Linux package E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
+      - name: Install XFS reflink test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes xfsprogs
+
+      - name: Exercise packed Linux artifacts on XFS reflink storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          RIFT_FIXTURE_EXCLUDE_TARGET=1 \
+            bash scripts/ci/linux-fs.sh xfs-reflink -- \
+              bash scripts/ci/linux-package-e2e.sh
+
   apfs-test:
     name: APFS integration tests
     runs-on: macos-15
@@ -95,6 +134,9 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
       - name: Run tests on APFS
         env:
           RIFT_REQUIRE_APFS_TESTS: "1"
@@ -103,20 +145,32 @@ jobs:
       - name: Build native package artifacts
         run: cargo build --package rift-cli --package rift-ffi --release --locked
 
-      - name: Pack and install the macOS artifact
+      - name: Pack public and native macOS artifacts
         id: package
         shell: bash
         run: |
           test "$(uname -m)" = arm64
-          node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/darwin-arm64" "target/release/rift" "target/release/librift_ffi.dylib"
+          node scripts/prepare-npm-native.mjs "npm/rift-darwin-arm64" "target/release/rift" "target/release/librift_ffi.dylib"
           output="$RUNNER_TEMP/rift-ci-npm-package"
           consumer="$RUNNER_TEMP/rift-ci-npm-consumer"
           mkdir -p "$output" "$consumer"
-          npm pack ./npm/rift-snapshot --json --pack-destination "$output" > "$output/pack.json"
-          filename="$(node -e 'const [entry] = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(entry.filename)' "$output/pack.json")"
-          npm install --prefix "$consumer" --ignore-scripts "$output/$filename"
-          cp scripts/test-packed-api.mjs scripts/test-packed-cli.mjs "$consumer/"
+          npm pack ./npm/rift-darwin-arm64 --json --pack-destination "$output" > "$output/native-pack.json"
+          native="$(node scripts/npm-pack-filename.mjs "$output/native-pack.json")"
+          node scripts/verify-npm-native-package.mjs "$output/$native" darwin-arm64
+          npm pack ./npm/rift --json --pack-destination "$output" > "$output/root-pack.json"
+          root="$(node scripts/npm-pack-filename.mjs "$output/root-pack.json")"
+          node scripts/verify-npm-package.mjs "$output/$root"
+          npm install --prefix "$consumer" --ignore-scripts --omit=optional "$output/$root"
+          cp scripts/test-missing-native.mjs scripts/test-packed-api.mjs scripts/test-packed-cli.mjs "$consumer/"
           echo "consumer=$consumer" >> "$GITHUB_OUTPUT"
+          echo "native=$output/$native" >> "$GITHUB_OUTPUT"
+
+      - name: Verify missing native package diagnostics
+        working-directory: ${{ steps.package.outputs.consumer }}
+        run: node --experimental-ffi ./test-missing-native.mjs
+
+      - name: Install the matching native package without lifecycle scripts
+        run: npm install --prefix "${{ steps.package.outputs.consumer }}" --ignore-scripts --omit=optional "${{ steps.package.outputs.native }}"
 
       - name: Exercise packed Node FFI API
         working-directory: ${{ steps.package.outputs.consumer }}
@@ -131,7 +185,7 @@ jobs:
         run: node ./test-packed-cli.mjs
 
   windows-core-test:
-    name: Windows core tests
+    name: Windows core and package E2E
     runs-on: windows-2025
     steps:
       - name: Check out repository
@@ -140,5 +194,51 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
       - name: Run workspace tests
         run: cargo test --workspace --locked
+
+      - name: Exercise packed Windows artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --package rift-cli --package rift-ffi --release --locked
+          output="$(mktemp -d)"
+          consumer="$output/consumer"
+          mkdir -p "$consumer"
+          node scripts/prepare-npm-native.mjs npm/rift-windows-x64 target/release/rift.exe target/release/rift_ffi.dll
+          npm pack ./npm/rift-windows-x64 --json --pack-destination "$output" > "$output/native-pack.json"
+          native="$(node scripts/npm-pack-filename.mjs "$output/native-pack.json")"
+          node scripts/verify-npm-native-package.mjs "$output/$native" windows-x64
+          npm pack ./npm/rift --json --pack-destination "$output" > "$output/root-pack.json"
+          root="$(node scripts/npm-pack-filename.mjs "$output/root-pack.json")"
+          node scripts/verify-npm-package.mjs "$output/$root"
+          npm install --prefix "$consumer" --ignore-scripts --omit=optional "$output/$root"
+          cp \
+            scripts/test-missing-native.mjs \
+            scripts/test-packed-unavailable-api.mjs \
+            scripts/test-packed-unavailable-cli.mjs \
+            "$consumer/"
+          (
+            cd "$consumer"
+            node --experimental-ffi ./test-missing-native.mjs
+          )
+          npm install --prefix "$consumer" --ignore-scripts --omit=optional "$output/$native"
+          (
+            cd "$consumer"
+            node --experimental-ffi ./test-packed-unavailable-api.mjs
+            bun ./test-packed-unavailable-api.mjs
+            node ./test-packed-unavailable-cli.mjs
+          )

@@ -199,7 +199,7 @@ The tool does not create branches, commit changes, or otherwise replace normal G
 Copying is implemented behind a `Strategy` interface so platform-specific copy-on-write backends can be added independently. Each strategy owns initialization, snapshot creation, and removal behavior for its filesystem.
 
 - The `BtrfsStrategy` production strategy on Linux uses writable btrfs subvolume snapshots.
-- The `BtrfsStrategy` performs native per-file reflink imports when `init` converts an existing ordinary workspace into a subvolume and when filtered `create` materializes only included paths. Exact `create` uses writable btrfs snapshots.
+- The `BtrfsStrategy` performs native per-file reflink imports when `init` converts an existing ordinary workspace into a subvolume and when filtered `create` already finds paths to omit or must preserve content across a nested-subvolume or mount boundary. Exact `create` uses writable btrfs snapshots; a clean filtered `create` filters its stable snapshot in place, so a concurrently created artifact is still omitted without materializing retained files.
 - The `LinuxReflinkStrategy` production strategy on Linux verifies native reflink support during `init` and uses native per-file reflinks during `create` without spawning an external copy command. XFS uses this path, as do other Linux filesystems when their `FICLONE` support succeeds.
 - The `ApfsStrategy` production strategy on macOS uses APFS `clonefile` directory cloning for exact copies and per-entry cloning for filtered copies.
 - If no implemented copy-on-write strategy succeeds, `create` fails.
@@ -217,7 +217,7 @@ The project ships four interfaces backed by the same implementation and metadata
 
 The CLI and language bindings should remain thin and expose the same API semantics as the native library.
 
-The npm launcher package temporarily publishes as `rift-snapshot` and bundles prebuilt CLI binaries and FFI shared libraries for every supported target under `prebuilds/<platform>-<arch>/`. It must not require install lifecycle scripts; its CLI shim resolves the bundled executable at runtime, and conditional exports make `import "rift-snapshot"` select the Bun or experimental Node FFI binding automatically. When the `rift` npm name is available, only the launcher package name changes.
+The npm launcher package publishes as `@jparklev/rift`, a project-owned namespace that avoids collisions with unrelated unscoped packages. It pins six OS/architecture-restricted optional packages named `@jparklev/rift-<platform>-<arch>`; each native package contains exactly one CLI binary and FFI shared library. Package managers install only the matching tuple, so consumers never download or cache the other targets. Neither the public nor native packages may require install lifecycle scripts. The CLI shim resolves the matching executable at runtime, and conditional exports make `import "@jparklev/rift"` select the Bun or experimental Node FFI binding automatically. If the project later owns the unscoped `rift` npm name, only the launcher package name changes.
 
 For CLI ergonomics, the primary workspace path for `rift init`, `rift create`, `rift remove`, `rift list`, and `rift ancestors` defaults to the current working directory when it is omitted. Workspace operations locate their root by searching upward for its `.rift` marker. The CLI applies similar selection before calling exact-path core `init`, unless `rift init --here` is explicitly requested.
 

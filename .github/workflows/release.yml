@@ -32,6 +32,9 @@ jobs:
         with:
           node-version-file: .node-version
 
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -61,6 +64,7 @@ jobs:
         run: |
           test "$(node --version)" = "v${NODE_VERSION}"
           test "$(bun --version)" = "${BUN_VERSION}"
+          test "$(npm --version)" = "${NPM_VERSION}"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -120,12 +124,62 @@ jobs:
         with:
           node-version-file: .node-version
 
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
+      - name: Install Linux package filesystem tools
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes xfsprogs
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
       - name: Build native artifacts
         run: cargo build --package rift-cli --package rift-ffi --release --locked --target ${{ matrix.target }}
 
-      - name: Populate npm prebuild
+      - name: Pack native npm artifact
         shell: bash
-        run: node scripts/prepare-npm-prebuild.mjs "npm/rift-snapshot/prebuilds/${{ matrix.platform }}" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "target/${{ matrix.target }}/release/${{ matrix.library }}"
+        run: |
+          package="npm/rift-${{ matrix.platform }}"
+          output="npm-dist"
+          node scripts/prepare-npm-native.mjs "$package" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "target/${{ matrix.target }}/release/${{ matrix.library }}"
+          mkdir -p "$output"
+          npm pack "$package" --json --pack-destination "$output" > "$output/pack.json"
+          filename="$(node scripts/npm-pack-filename.mjs "$output/pack.json")"
+          node scripts/verify-npm-native-package.mjs "$output/$filename" "${{ matrix.platform }}"
+
+      - name: Exercise the matching packed npm artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
+          native="$(find npm-dist -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$native"
+          if [[ "$platform" == linux-* ]]; then
+            RIFT_FIXTURE_EXCLUDE_TARGET=1 \
+              RIFT_NATIVE_PLATFORM="$platform" \
+              RIFT_NATIVE_TARBALL="$native" \
+              bash scripts/ci/linux-fs.sh xfs-reflink -- \
+                bash scripts/ci/linux-package-e2e.sh
+            exit 0
+          fi
+          output="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$output"
+          }
+          trap cleanup EXIT
+          npm pack ./npm/rift --json --pack-destination "$output" > "$output/root-pack.json"
+          root="$output/$(node scripts/npm-pack-filename.mjs "$output/root-pack.json")"
+          if [[ "$platform" == windows-* ]]; then
+            mode=unavailable
+          else
+            mode=lifecycle
+          fi
+          bash scripts/ci/packed-npm-e2e.sh "$platform" "$mode" "$root" "$native"
 
       - name: Package archive
         if: matrix.archive == 'tar'
@@ -156,11 +210,11 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: Upload npm prebuild
+      - name: Upload native npm artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: npm-prebuild-${{ matrix.platform }}
-          path: npm/rift-snapshot/prebuilds/${{ matrix.platform }}
+          name: npm-native-${{ matrix.platform }}
+          path: npm-dist/*.tgz
           if-no-files-found: error
 
   package:
@@ -184,82 +238,56 @@ jobs:
       - name: Install release npm
         run: npm install --global npm@${{ env.NPM_VERSION }}
 
-      - name: Download Linux x64 prebuild
+      - name: Download the matching native package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: npm-prebuild-linux-x64
-          path: npm/rift-snapshot/prebuilds/linux-x64
+          name: npm-native-darwin-arm64
+          path: ${{ runner.temp }}/rift-npm-native
 
-      - name: Download Linux arm64 prebuild
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-prebuild-linux-arm64
-          path: npm/rift-snapshot/prebuilds/linux-arm64
-
-      - name: Download macOS x64 prebuild
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-prebuild-darwin-x64
-          path: npm/rift-snapshot/prebuilds/darwin-x64
-
-      - name: Download macOS arm64 prebuild
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-prebuild-darwin-arm64
-          path: npm/rift-snapshot/prebuilds/darwin-arm64
-
-      - name: Download Windows x64 prebuild
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-prebuild-windows-x64
-          path: npm/rift-snapshot/prebuilds/windows-x64
-
-      - name: Download Windows arm64 prebuild
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-prebuild-windows-arm64
-          path: npm/rift-snapshot/prebuilds/windows-arm64
-
-      - name: Restore executable permissions
-        run: chmod +x npm/rift-snapshot/prebuilds/linux-*/rift npm/rift-snapshot/prebuilds/darwin-*/rift
-
-      - name: Pack release artifact
+      - name: Pack public release artifact
         id: pack
         shell: bash
         run: |
           output="$RUNNER_TEMP/rift-npm-package"
+          native_directory="$RUNNER_TEMP/rift-npm-native"
           mkdir -p "$output"
-          npm pack ./npm/rift-snapshot --json --pack-destination "$output" > "$output/pack.json"
-          filename="$(node -e 'const [entry] = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(entry.filename)' "$output/pack.json")"
-          echo "tarball=$output/$filename" >> "$GITHUB_OUTPUT"
-
-      - name: Verify packed contents
-        run: node scripts/verify-npm-package.mjs "${{ steps.pack.outputs.tarball }}"
-
-      - name: Install packed artifact without lifecycle scripts
-        shell: bash
-        run: |
+          native="$(find "$native_directory" -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$native"
+          node scripts/verify-npm-native-package.mjs "$native" darwin-arm64
+          npm pack ./npm/rift --json --pack-destination "$output" > "$output/pack.json"
+          filename="$(node scripts/npm-pack-filename.mjs "$output/pack.json")"
+          node scripts/verify-npm-package.mjs "$output/$filename"
           consumer="$RUNNER_TEMP/rift-npm-consumer"
           mkdir -p "$consumer"
-          npm install --prefix "$consumer" --ignore-scripts "${{ steps.pack.outputs.tarball }}"
-          cp scripts/test-packed-api.mjs scripts/test-packed-cli.mjs "$consumer/"
+          npm install --prefix "$consumer" --ignore-scripts --omit=optional "$output/$filename"
+          cp scripts/test-missing-native.mjs scripts/test-packed-api.mjs scripts/test-packed-cli.mjs "$consumer/"
+          echo "tarball=$output/$filename" >> "$GITHUB_OUTPUT"
+          echo "consumer=$consumer" >> "$GITHUB_OUTPUT"
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+
+      - name: Verify missing native package diagnostics
+        working-directory: ${{ steps.pack.outputs.consumer }}
+        run: node --experimental-ffi ./test-missing-native.mjs
+
+      - name: Install matching native package without lifecycle scripts
+        run: npm install --prefix "${{ steps.pack.outputs.consumer }}" --ignore-scripts --omit=optional "${{ steps.pack.outputs.native }}"
 
       - name: Exercise packed Node FFI API
-        working-directory: ${{ runner.temp }}/rift-npm-consumer
+        working-directory: ${{ steps.pack.outputs.consumer }}
         run: node --experimental-ffi ./test-packed-api.mjs
 
       - name: Exercise packed Bun FFI API
-        working-directory: ${{ runner.temp }}/rift-npm-consumer
+        working-directory: ${{ steps.pack.outputs.consumer }}
         run: bun ./test-packed-api.mjs
 
       - name: Exercise packed CLI
-        working-directory: ${{ runner.temp }}/rift-npm-consumer
+        working-directory: ${{ steps.pack.outputs.consumer }}
         run: node ./test-packed-cli.mjs
 
-      - name: Upload tested npm artifact
+      - name: Upload tested public npm artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: npm-package
+          name: npm-root-package
           path: ${{ steps.pack.outputs.tarball }}
           if-no-files-found: error
 
@@ -278,11 +306,99 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Download tested npm artifact
+      - name: Download native npm artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: npm-package
-          path: npm-package
+          pattern: npm-native-*
+          path: npm-native
+          merge-multiple: true
+
+      - name: Download tested public npm artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-root-package
+          path: npm-root
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install release npm
+        run: npm install --global npm@${{ env.NPM_VERSION }}
+
+      - name: Install XFS reflink test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes xfsprogs
+
+      - name: Publish native packages first
+        env:
+          NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${NPM_PUBLISH_TOKEN:-}" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_PUBLISH_TOKEN"
+          fi
+          for manifest in npm/rift-*/package.json; do
+            name="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(manifest.name)' "$manifest")"
+            version="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(manifest.version)' "$manifest")"
+            tarball="$(node scripts/npm-find-tarball.mjs npm-native "$name" "$version")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              test "$(npm view "$name@$version" version)" = "$version"
+              echo "$name@$version is already published"
+            else
+              npm publish "$tarball" --provenance --access public
+            fi
+          done
+
+      - name: Verify every native package is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in npm/rift-*/package.json; do
+            name="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(manifest.name)' "$manifest")"
+            version="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(manifest.version)' "$manifest")"
+            test "$(npm view "$name@$version" version)" = "$version"
+          done
+
+      - name: Exercise a normal optional-dependency installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(find npm-root -type f -name '*.tgz' -print -quit)"
+          test -n "$root"
+          RIFT_FIXTURE_EXCLUDE_TARGET=1 \
+            RIFT_PACKED_ROOT_TARBALL="$root" \
+            bash scripts/ci/linux-fs.sh xfs-reflink -- \
+              bash -c 'bash scripts/ci/packed-npm-e2e.sh linux-x64 lifecycle "$RIFT_PACKED_ROOT_TARBALL"'
+
+      - name: Publish the tested public npm artifact
+        env:
+          NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${NPM_PUBLISH_TOKEN:-}" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_PUBLISH_TOKEN"
+          fi
+          root="$(find npm-root -type f -name '*.tgz' -print -quit)"
+          test -n "$root"
+          name="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync("npm/rift/package.json", "utf8")); process.stdout.write(manifest.name)')"
+          version="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync("npm/rift/package.json", "utf8")); process.stdout.write(manifest.version)')"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            test "$(npm view "$name@$version" version)" = "$version"
+            echo "$name@$version is already published"
+          else
+            npm publish "$root" --provenance --access public
+          fi
 
       - name: Create checksums
         working-directory: dist
@@ -299,15 +415,3 @@ jobs:
           else
             gh release create "$TAG" dist/* --verify-tag --generate-notes --title "$TAG"
           fi
-
-      - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version-file: .node-version
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Install release npm
-        run: npm install --global npm@${{ env.NPM_VERSION }}
-
-      - name: Publish the tested npm artifact
-        run: npm publish npm-package/*.tgz --provenance

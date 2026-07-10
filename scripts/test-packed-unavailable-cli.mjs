@@ -8,7 +8,7 @@ import path from "node:path"
 
 const testRoot = process.env.RIFT_PACKED_TEST_ROOT ?? os.tmpdir()
 fs.mkdirSync(testRoot, { recursive: true })
-const temporary = fs.mkdtempSync(path.join(testRoot, "rift-packed-cli-"))
+const temporary = fs.mkdtempSync(path.join(testRoot, "rift-packed-unavailable-cli-"))
 const launcher = path.join(process.cwd(), "node_modules", "@jparklev", "rift", "bin", "rift.js")
 const dataHome = path.join(temporary, "data")
 const environment = {
@@ -24,30 +24,29 @@ function run(arguments_) {
     env: environment,
   })
   if (result.error) throw result.error
-  if (result.status !== 0) {
-    throw new Error(`rift ${arguments_.join(" ")} failed:\n${result.stderr}`)
-  }
-  return result.stdout.trim()
+  return result
+}
+
+function assertCowUnavailable(result) {
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /copy-on-write cloning unavailable/i)
 }
 
 try {
   const source = path.join(temporary, "source")
   fs.mkdirSync(environment.HOME)
   fs.mkdirSync(source)
-  fs.writeFileSync(path.join(source, "kept.txt"), "from packed CLI")
+  fs.writeFileSync(path.join(source, "kept.txt"), "from packed unavailable CLI")
 
-  run(["init", source, "--here"])
-  const status = JSON.parse(run(["status", source, "--json"]))
-  assert.equal(status.path, fs.realpathSync(source))
-  assert.equal(status.parent, null)
-
-  const child = run(["create", source, "--name", "packed-cli"])
-  assert.equal(fs.readFileSync(path.join(child, "kept.txt"), "utf8"), "from packed CLI")
-  assert.deepEqual(run(["list", source]).split("\n").filter(Boolean), [child])
-
-  run(["remove", child])
-  run(["gc"])
-  console.log("packed CLI lifecycle passed")
+  const init = run(["init", source, "--here"])
+  if (init.status !== 0) {
+    assertCowUnavailable(init)
+  } else {
+    const status = run(["status", source, "--json"])
+    assert.equal(status.status, 0, status.stderr)
+    assertCowUnavailable(run(["create", source, "--name", "unavailable"]))
+  }
+  console.log("packed CLI rejects unavailable copy-on-write storage")
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true })
 }

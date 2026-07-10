@@ -1,0 +1,22 @@
+{
+  "name": "@jparklev/rift-darwin-x64",
+  "version": "0.0.11",
+  "description": "Rift native artifacts for macOS x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jparklev/rift.git"
+  },
+  "files": ["bin", "lib"],
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "preferUnplugged": true,
+  "rift": {
+    "binary": "bin/rift",
+    "library": "lib/librift_ffi.dylib"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

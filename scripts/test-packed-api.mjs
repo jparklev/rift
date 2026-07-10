@@ -4,9 +4,11 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import * as rift from "rift-snapshot"
+import * as rift from "@jparklev/rift"
 
-const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "rift-packed-api-"))
+const testRoot = process.env.RIFT_PACKED_TEST_ROOT ?? os.tmpdir()
+fs.mkdirSync(testRoot, { recursive: true })
+const temporary = fs.mkdtempSync(path.join(testRoot, "rift-packed-api-"))
 
 try {
   const source = path.join(temporary, "source")

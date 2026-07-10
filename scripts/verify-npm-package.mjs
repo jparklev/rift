@@ -11,27 +11,40 @@ if (!tarball) {
 const contents = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
   .split("\n")
   .filter(Boolean)
+  .filter((entry) => !entry.endsWith("/"))
   .sort()
-const prebuilds = contents.filter((entry) => entry.startsWith("package/prebuilds/"))
 
 const expected = [
-  "package/prebuilds/darwin-arm64/librift_ffi.dylib",
-  "package/prebuilds/darwin-arm64/rift",
-  "package/prebuilds/darwin-x64/librift_ffi.dylib",
-  "package/prebuilds/darwin-x64/rift",
-  "package/prebuilds/linux-arm64/librift_ffi.so",
-  "package/prebuilds/linux-arm64/rift",
-  "package/prebuilds/linux-x64/librift_ffi.so",
-  "package/prebuilds/linux-x64/rift",
-  "package/prebuilds/windows-arm64/rift.exe",
-  "package/prebuilds/windows-arm64/rift_ffi.dll",
-  "package/prebuilds/windows-x64/rift.exe",
-  "package/prebuilds/windows-x64/rift_ffi.dll",
+  "package/bin/rift.js",
+  "package/bun/index.js",
+  "package/index.d.ts",
+  "package/native.js",
+  "package/node/index.js",
+  "package/package.json",
 ]
 
-assert.deepEqual(prebuilds, expected, "the packed package must contain every declared platform tuple")
-for (const required of ["package/bin/rift.js", "package/bun/index.js", "package/node/index.js"]) {
-  assert(contents.includes(required), `missing ${required} from packed package`)
+assert.deepEqual(contents, expected, "the public package must contain only portable JavaScript")
+assert(!contents.some((entry) => entry.startsWith("package/prebuilds/")), "the public package must not bundle native prebuilds")
+
+const manifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" }))
+const tuples = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "windows-arm64",
+  "windows-x64",
+]
+const packageName = "@jparklev/rift"
+assert.equal(manifest.name, packageName)
+assert.deepEqual(
+  manifest.optionalDependencies,
+  Object.fromEntries(tuples.map((tuple) => [`${packageName}-${tuple}`, manifest.version])),
+  "the public package must pin every matching native package to its exact version",
+)
+assert.equal(manifest.publishConfig?.access, "public", "the public package must publish publicly")
+for (const lifecycle of ["preinstall", "install", "postinstall", "prepare"]) {
+  assert.equal(manifest.scripts?.[lifecycle], undefined, `the public package must not use ${lifecycle}`)
 }
 
-console.log(`verified ${expected.length} native files in ${tarball}`)
+console.log(`verified portable public package in ${tarball}`)

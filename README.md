@@ -15,10 +15,12 @@ more support soon
 ## Install
 
 ```bash
-npm install -g rift-snapshot
+npm install -g @jparklev/rift
 # or
-bun add -g rift-snapshot
+bun add -g @jparklev/rift
 ```
+
+The portable `@jparklev/rift` package resolves one matching OS/architecture-native optional package at runtime. Installs do not download the other platforms' CLI or FFI artifacts and do not run lifecycle scripts.
 
 Release archives are available from [GitHub Releases](https://github.com/jparklev/rift/releases/latest).
 
@@ -64,7 +66,7 @@ By default, creation omits heavyweight regenerable dependency and build artifact
 
 > Storage note: on a copy-on-write filesystem a clone shares its data blocks with the source, so cloning dependency directories costs almost no disk. If a postcreate hook reinstalls dependencies, the fresh install writes new, unshared blocks — in that workflow `--copy-all` with no reinstall is usually the cheaper option on disk. Filtering saves filesystem metadata and guarantees regenerable artifacts are rebuilt fresh.
 
-On btrfs, exact copies use writable subvolume snapshots and filtered copies use a reflink import into a new subvolume. On other reflink-capable Linux filesystems, Rift reflink-clones the selected directory tree. On macOS, exact copies use APFS `clonefile`, and filtered copies clone included entries.
+On btrfs, exact copies use writable subvolume snapshots. For a clean, boundary-free source, filtered creation takes a stable writable snapshot and applies the same filter to that image; it therefore retains Btrfs's shared data and metadata even if a build starts concurrently. Sources with paths already known to omit, or with nested subvolume or mount boundaries, use a reflink import containing only retained paths. On other reflink-capable Linux filesystems, Rift reflink-clones the selected directory tree. On macOS, exact copies use APFS `clonefile`, and filtered copies clone included entries.
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
 
@@ -143,7 +145,7 @@ Default created-workspace storage is adjacent to the registered source root:
 The package selects a Bun or Node FFI binding through conditional exports.
 
 ```ts
-import { create, list, remove, status, gc } from "rift-snapshot";
+import { create, list, remove, status, gc } from "@jparklev/rift";
 
 const workspace = create({ from: process.cwd(), name: "schema-work" });
 console.log(list({ of: process.cwd() }));
@@ -196,7 +198,7 @@ Benchmark a single real `rift create` operation against a directory:
 cargo bench --bench create -- /path/to/linux
 ```
 
-The benchmark initializes the supplied directory before timing, times only creation of the new rift, and then removes the created workspace outside the measured interval. On first use, initialization of an ordinary Linux btrfs directory converts it into a subvolume before measurement. The benchmark uses the production filesystem strategy, so results measure APFS cloning on macOS, btrfs snapshots on btrfs, and per-file reflinks on reflink-capable Linux filesystems.
+The benchmark initializes the supplied directory before timing, times only creation of the new rift, and then removes the created workspace outside the measured interval. On first use, initialization of an ordinary Linux btrfs directory converts it into a subvolume before measurement. The benchmark uses the production filesystem strategy: APFS `clonefile` on macOS, a writable btrfs snapshot when the stable default-filter image has nothing to omit or cross a copy boundary, and per-file reflinks when filtering must materialize only retained paths.
 
 Establish a baseline by measuring multiple independent rift creations and writing an aggregate machine-readable result file. Keep results outside the source workspace so they do not alter future measurements:
 

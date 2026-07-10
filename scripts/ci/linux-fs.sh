@@ -161,7 +161,17 @@ copy_checkout() {
   section "copy checkout"
   sudo chown "${USER}:${USER}" "${mountpoint}"
   mkdir -p "${checkout}"
-  cp -a "${workspace}/." "${checkout}"
+  if [[ "${RIFT_FIXTURE_EXCLUDE_TARGET:-}" == "1" ]]; then
+    (
+      cd "${workspace}"
+      tar --exclude='./target' -cf - .
+    ) | (
+      cd "${checkout}"
+      tar -xf -
+    )
+  else
+    cp -a "${workspace}/." "${checkout}"
+  fi
 }
 
 print_diagnostics() {

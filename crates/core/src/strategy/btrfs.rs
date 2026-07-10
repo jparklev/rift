@@ -5,7 +5,9 @@ use super::reflink::{
     MetadataTarget, copy_metadata_linux, import_directory_linux, import_directory_linux_filtered,
 };
 use super::{Strategy, StrategyInit};
-use crate::{CopyMode, Error, InitProgress, Result};
+use crate::{CopyMode, Error, InitProgress, Result, filter::CopyFilter};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -44,8 +46,46 @@ fn copy_directory_linux(from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
     }
     match mode {
         CopyMode::All => create_btrfs_snapshot(from, to),
-        CopyMode::Filtered => create_filtered_btrfs_subvolume(from, to),
+        CopyMode::Filtered => create_stable_filtered_btrfs_copy(from, to),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_stable_filtered_btrfs_copy(from: &Path, to: &Path) -> Result<()> {
+    // Check filtering and copy boundaries in one directory walk. An excluded
+    // directory stops the walk before its descendants, preserving the old
+    // dirty-tree fast path for large `node_modules` or `target` trees.
+    if !source_allows_filtered_snapshot(from)? {
+        return create_filtered_btrfs_subvolume(from, to);
+    }
+
+    // Snapshot first, then filter the destination itself. This closes the
+    // window where a compiler can create `target/` after the clean source
+    // preflight but before Btrfs takes its atomic source image.
+    create_btrfs_snapshot(from, to)?;
+    let result = (|| {
+        // Recheck mount/subvolume boundaries after the snapshot. A nested
+        // subvolume created during the first scan is detected while filtering
+        // the snapshot as an inode-2 stub.
+        if source_has_snapshot_boundary(from)? {
+            remove_directory_linux(to)?;
+            return create_filtered_btrfs_subvolume(from, to);
+        }
+
+        // The snapshot is writable and already shares its retained blocks
+        // with the source. Prune only paths the exact CopyFilter excludes;
+        // this preserves a clean snapshot's shared metadata and avoids a new
+        // hidden staging subvolume that a crash could orphan.
+        if prune_filtered_snapshot(to)? {
+            remove_directory_linux(to)?;
+            return create_filtered_btrfs_subvolume(from, to);
+        }
+        Ok(())
+    })();
+    if result.is_err() && to.exists() {
+        let _ = remove_directory_linux(to);
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -538,7 +578,7 @@ fn is_btrfs_subvolume(path: &Path) -> Result<bool> {
     if !is_btrfs_filesystem(path)? {
         return Ok(false);
     }
-    Ok(fs::metadata(path)?.ino() == 256)
+    Ok(fs::metadata(path)?.ino() == BTRFS_SUBVOLUME_INODE)
 }
 
 #[cfg(target_os = "linux")]
@@ -564,6 +604,223 @@ fn create_btrfs_snapshot(from: &Path, to: &Path) -> Result<()> {
         "snapshot",
     )
 }
+
+/// Return whether a source is both clean under `CopyFilter` and safe for a
+/// recursive Btrfs snapshot. The single scan avoids walking a dirty artifact
+/// tree merely to discover that the established filtered import is required.
+#[cfg(target_os = "linux")]
+fn source_allows_filtered_snapshot(source: &Path) -> Result<bool> {
+    let Some(root) = snapshot_identity(source)? else {
+        return Ok(false);
+    };
+    let filter = CopyFilter::for_source(source);
+    let mut directories = vec![source.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(source)
+                .map_err(|error| Error::Path(error.to_string()))?;
+            if filter.excludes(relative) {
+                return Ok(false);
+            }
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(identity) = snapshot_identity(&path)? else {
+                return Ok(false);
+            };
+            if identity.mount_id != root.mount_id || identity.inode == BTRFS_SUBVOLUME_INODE {
+                return Ok(false);
+            }
+            directories.push(path);
+        }
+    }
+    Ok(true)
+}
+
+/// A snapshot cannot reproduce either a nested Btrfs subvolume or an
+/// overlaid mount. `statx` provides the mount ID and inode in one lookup; if
+/// the kernel cannot provide both, prefer the established materialized copy
+/// path over a potentially incomplete snapshot.
+#[cfg(target_os = "linux")]
+fn source_has_snapshot_boundary(source: &Path) -> Result<bool> {
+    let Some(root) = snapshot_identity(source)? else {
+        return Ok(true);
+    };
+    let mut directories = vec![source.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(identity) = snapshot_identity(&path)? else {
+                return Ok(true);
+            };
+            if identity.mount_id != root.mount_id || identity.inode == BTRFS_SUBVOLUME_INODE {
+                return Ok(true);
+            }
+            directories.push(path);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn prune_filtered_snapshot(snapshot: &Path) -> Result<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let filter = CopyFilter::for_source(snapshot);
+    let mut excluded = Vec::new();
+    let mut walker = walkdir::WalkDir::new(snapshot)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry?;
+        let relative = entry
+            .path()
+            .strip_prefix(snapshot)
+            .expect("walked entries always remain below their root");
+        if filter.excludes(relative) {
+            excluded.push(entry.path().to_path_buf());
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        // A nested subvolume created after the source-boundary scan becomes
+        // an inode-2 stub in the snapshot. Return before deleting anything so
+        // the caller can discard it and materialize from the live source.
+        if entry.file_type().is_dir() && fs::metadata(entry.path())?.ino() == BTRFS_EMPTY_STUB_INODE
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut modes = BTreeMap::new();
+    let removal = (|| {
+        for path in excluded {
+            make_ancestors_writable(snapshot, &path, &mut modes)?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                make_tree_writable(&path, &mut modes)?;
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    })();
+    let restore = modes.into_iter().try_for_each(|(path, mode)| {
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    removal.and(restore.map_err(Error::from))?;
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn make_ancestors_writable(
+    snapshot: &Path,
+    path: &Path,
+    modes: &mut BTreeMap<PathBuf, u32>,
+) -> Result<()> {
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        make_directory_writable(directory, modes)?;
+        if directory == snapshot {
+            return Ok(());
+        }
+        ancestor = directory.parent();
+    }
+    Err(Error::Path(format!(
+        "filtered path escaped its snapshot: {}",
+        path.display()
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn make_tree_writable(path: &Path, modes: &mut BTreeMap<PathBuf, u32>) -> Result<()> {
+    make_directory_writable(path, modes)?;
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            make_directory_writable(entry.path(), modes)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn make_directory_writable(path: &Path, modes: &mut BTreeMap<PathBuf, u32>) -> Result<()> {
+    use std::collections::btree_map::Entry;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path)?.permissions().mode();
+    if let Entry::Vacant(entry) = modes.entry(path.to_path_buf()) {
+        entry.insert(mode);
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o300))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct SnapshotIdentity {
+    mount_id: u64,
+    inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_identity(path: &Path) -> Result<Option<SnapshotIdentity>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Path(format!("path contains a null byte: {}", path.display())))?;
+    // SAFETY: `stat` is a C struct that the kernel fully initializes on a
+    // successful `statx` call.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    let requested = libc::STATX_INO | libc::STATX_MNT_ID;
+    // SAFETY: `path` is a live C string and `stat` points to writable storage
+    // with the exact layout required by the documented `statx` syscall ABI.
+    // Call the syscall directly rather than glibc's `statx` wrapper so a
+    // release binary remains loadable on glibc versions older than 2.28.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            requested,
+            &mut stat,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => Ok(None),
+            _ => Err(error.into()),
+        };
+    }
+    if stat.stx_mask & requested != requested {
+        return Ok(None);
+    }
+    Ok(Some(SnapshotIdentity {
+        mount_id: stat.stx_mnt_id,
+        inode: stat.stx_ino,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+const BTRFS_EMPTY_STUB_INODE: u64 = 2;
+#[cfg(target_os = "linux")]
+const BTRFS_SUBVOLUME_INODE: u64 = 256;
 
 #[cfg(target_os = "linux")]
 fn delete_btrfs_subvolume(path: &Path) -> Result<()> {
@@ -893,8 +1150,18 @@ mod linux_tests {
         );
         assert_copy_diverges_after_mutation(&source.join("file.txt"), &snapshot.join("file.txt"));
 
+        // A clean filtered tree takes the same writable snapshot path as an
+        // exact copy. Git refs with artifact-looking names are retained and
+        // must not make the preflight report a false exclusion.
+        fs::create_dir_all(source.join(".git/refs/heads/build")).unwrap();
+        fs::write(source.join(".git/refs/heads/build/main"), "ref").unwrap();
+        assert!(source_allows_filtered_snapshot(&source).unwrap());
         copy_directory_linux(&source, &filtered, CopyMode::Filtered).unwrap();
         assert!(is_btrfs_subvolume(&filtered).unwrap());
+        assert_eq!(
+            fs::read_to_string(filtered.join(".git/refs/heads/build/main")).unwrap(),
+            "ref"
+        );
         assert_copy_diverges_after_mutation(&source.join("file.txt"), &filtered.join("file.txt"));
 
         remove_directory_linux(&filtered).unwrap();
@@ -903,6 +1170,94 @@ mod linux_tests {
         assert!(!filtered.exists());
         assert!(!snapshot.exists());
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn native_filtered_copy_keeps_the_import_path_when_an_artifact_is_present() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        let filtered = temp.path().join("filtered");
+        create_btrfs_subvolume(&source).unwrap();
+        fs::write(source.join("kept.txt"), "keep").unwrap();
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "drop").unwrap();
+
+        assert!(!source_allows_filtered_snapshot(&source).unwrap());
+
+        copy_directory_linux(&source, &filtered, CopyMode::Filtered).unwrap();
+
+        assert!(is_btrfs_subvolume(&filtered).unwrap());
+        assert_eq!(
+            fs::read_to_string(filtered.join("kept.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!filtered.join("node_modules").exists());
+        remove_directory_linux(&filtered).unwrap();
+        remove_directory_linux(&source).unwrap();
+    }
+
+    #[test]
+    fn filtering_a_stable_snapshot_prunes_artifacts_from_a_read_only_tree() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        let snapshot = temp.path().join("snapshot");
+        create_btrfs_subvolume(&source).unwrap();
+        fs::write(source.join("kept.txt"), "keep shared data").unwrap();
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "drop").unwrap();
+        fs::set_permissions(
+            source.join("node_modules"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o500)).unwrap();
+
+        create_btrfs_snapshot(&source, &snapshot).unwrap();
+        assert!(!prune_filtered_snapshot(&snapshot).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(snapshot.join("kept.txt")).unwrap(),
+            "keep shared data"
+        );
+        assert!(!snapshot.join("node_modules").exists());
+        assert!(source.join("node_modules/pkg/index.js").exists());
+        assert_eq!(
+            fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_directory_linux(&snapshot).unwrap();
+        remove_directory_linux(&source).unwrap();
+    }
+
+    #[test]
+    fn native_filtered_copy_materializes_nested_subvolume_contents() {
+        let Some(temp) = btrfs_temp() else {
+            return;
+        };
+        let source = temp.path().join("source");
+        let nested = source.join("nested");
+        let filtered = temp.path().join("filtered");
+        create_btrfs_subvolume(&source).unwrap();
+        create_btrfs_subvolume(&nested).unwrap();
+        fs::write(nested.join("kept.txt"), "keep nested content").unwrap();
+
+        assert!(!source_allows_filtered_snapshot(&source).unwrap());
+        assert!(source_has_snapshot_boundary(&source).unwrap());
+        copy_directory_linux(&source, &filtered, CopyMode::Filtered).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(filtered.join("nested/kept.txt")).unwrap(),
+            "keep nested content"
+        );
+        remove_directory_linux(&filtered).unwrap();
+        remove_directory_linux(&nested).unwrap();
+        remove_directory_linux(&source).unwrap();
     }
 
     #[test]
