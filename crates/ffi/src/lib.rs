@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn status_describes_an_initialized_workspace_through_the_protocol() {
+    fn status_describes_an_initialized_workspace_through_the_protocol_when_supported() {
         let fixture = std::env::temp_dir().join(format!(
             "rift-ffi-status-{}-{}",
             std::process::id(),
@@ -351,6 +351,11 @@ mod tests {
             "at": workspace,
         });
         let init = ffi_json(init);
+        if init["status"] == "error" {
+            assert_eq!(init["error"]["code"], "cow_unavailable");
+            std::fs::remove_dir_all(fixture).unwrap();
+            return;
+        }
         assert_eq!(init["status"], "ok");
         assert_eq!(init["value"], serde_json::Value::Null);
 
