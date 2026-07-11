@@ -2,13 +2,14 @@
 
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import { tarArgs } from "./tar-args.mjs"
 
 const tarball = process.argv[2]
 if (!tarball) {
   throw new Error("usage: node scripts/verify-npm-package.mjs <package.tgz>")
 }
 
-const contents = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
+const contents = execFileSync("tar", tarArgs(["-tzf", tarball]), { encoding: "utf8" })
   .split("\n")
   .filter(Boolean)
   .filter((entry) => !entry.endsWith("/"))
@@ -26,7 +27,9 @@ const expected = [
 assert.deepEqual(contents, expected, "the public package must contain only portable JavaScript")
 assert(!contents.some((entry) => entry.startsWith("package/prebuilds/")), "the public package must not bundle native prebuilds")
 
-const manifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" }))
+const manifest = JSON.parse(
+  execFileSync("tar", tarArgs(["-xOf", tarball, "package/package.json"]), { encoding: "utf8" }),
+)
 const tuples = [
   "darwin-arm64",
   "darwin-x64",

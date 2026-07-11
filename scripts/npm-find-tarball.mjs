@@ -3,6 +3,7 @@
 import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
+import { tarArgs } from "./tar-args.mjs"
 
 const [directory, expectedName, expectedVersion] = process.argv.slice(2)
 if (!directory || !expectedName || !expectedVersion || process.argv.length !== 5) {
@@ -11,7 +12,7 @@ if (!directory || !expectedName || !expectedVersion || process.argv.length !== 5
 
 const matches = tarballs(directory).filter((tarball) => {
   const manifest = JSON.parse(
-    execFileSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" }),
+    execFileSync("tar", tarArgs(["-xOf", tarball, "package/package.json"]), { encoding: "utf8" }),
   )
   return manifest.name === expectedName && manifest.version === expectedVersion
 })

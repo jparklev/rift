@@ -625,7 +625,14 @@ fn source_allows_filtered_snapshot(source: &Path) -> Result<bool> {
             if filter.excludes(relative) {
                 return Ok(false);
             }
-            if !entry.file_type()?.is_dir() {
+            let file_type = entry.file_type()?;
+            // Preserve the filtered-copy contract: retained entries must be
+            // representable by every supported strategy, even when Btrfs can
+            // snapshot a special entry without materializing it.
+            if !file_type.is_file() && !file_type.is_dir() && !file_type.is_symlink() {
+                return Err(Error::UnsupportedEntry(path));
+            }
+            if !file_type.is_dir() {
                 continue;
             }
             let Some(identity) = snapshot_identity(&path)? else {
@@ -691,6 +698,14 @@ fn prune_filtered_snapshot(snapshot: &Path) -> Result<bool> {
                 walker.skip_current_dir();
             }
             continue;
+        }
+        // A special entry can appear after the source preflight but before
+        // the atomic snapshot. Validate the immutable snapshot as well.
+        if !entry.file_type().is_file()
+            && !entry.file_type().is_dir()
+            && !entry.file_type().is_symlink()
+        {
+            return Err(Error::UnsupportedEntry(entry.path().to_path_buf()));
         }
         // A nested subvolume created after the source-boundary scan becomes
         // an inode-2 stub in the snapshot. Return before deleting anything so
@@ -1229,6 +1244,14 @@ mod linux_tests {
             fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
             0o500
         );
+        // The source intentionally keeps its read-only artifact to prove
+        // snapshot pruning did not mutate it. Restore write permission only
+        // for the test's non-privileged recursive teardown fallback.
+        fs::set_permissions(
+            source.join("node_modules"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o700)).unwrap();
         remove_directory_linux(&snapshot).unwrap();

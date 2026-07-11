@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
+import { tarArgs } from "./tar-args.mjs"
 
 const [tarball, tuple] = process.argv.slice(2)
 if (!tarball || !tuple || process.argv.length !== 4) {
@@ -18,7 +19,7 @@ const targets = {
 }[tuple]
 if (!targets) throw new Error(`unsupported Rift native target: ${tuple}`)
 
-const contents = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
+const contents = execFileSync("tar", tarArgs(["-tzf", tarball]), { encoding: "utf8" })
   .split("\n")
   .filter(Boolean)
   .filter((entry) => !entry.endsWith("/"))
@@ -29,7 +30,9 @@ assert.deepEqual(
   "the native package must contain exactly one CLI and one FFI library",
 )
 
-const manifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" }))
+const manifest = JSON.parse(
+  execFileSync("tar", tarArgs(["-xOf", tarball, "package/package.json"]), { encoding: "utf8" }),
+)
 assert.equal(manifest.name, `@jparklev/rift-${tuple}`)
 assert.deepEqual(manifest.os, [targets.os])
 assert.deepEqual(manifest.cpu, [targets.cpu])
@@ -42,7 +45,7 @@ for (const lifecycle of ["preinstall", "install", "postinstall", "prepare"]) {
 }
 
 if (targets.os !== "win32") {
-  const listing = execFileSync("tar", ["-tvzf", tarball], { encoding: "utf8" })
+  const listing = execFileSync("tar", tarArgs(["-tvzf", tarball]), { encoding: "utf8" })
   const binaryLine = listing.split("\n").find((line) => line.endsWith(`package/${targets.binary}`))
   assert.match(binaryLine ?? "", /^-rwx/, "the native CLI must be executable in the tarball")
 }

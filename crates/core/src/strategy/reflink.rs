@@ -86,7 +86,7 @@ fn import_directory_linux_with_filter(
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            filter.as_ref().map_or(true, |filter| {
+            filter.as_ref().is_none_or(|filter| {
                 entry
                     .path()
                     .strip_prefix(from)
