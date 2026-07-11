@@ -352,7 +352,7 @@ fn parse_init_state(path: &Path, contents: &str) -> Result<ulid::Ulid> {
 
 #[cfg(target_os = "linux")]
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err(Error::CowUnavailable(
             "invalid btrfs initialization state encoding".into(),
         ));
